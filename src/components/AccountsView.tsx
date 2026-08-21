@@ -388,7 +388,40 @@ export function AccountsView({
           </div>
         )}
 
-        {addTab === "browser" ? (
+        {addTab === "assisted" && (
+          <div className="assist">
+            {assistState === "idle" ? (
+              <>
+                <div className="assist-intro">
+                  <LogIn size={26} />
+                  <p>
+                    InstaVault abre una ventana propia donde inicias sesión en Instagram.
+                    Las cookies se capturan automáticamente al terminar.
+                  </p>
+                </div>
+                <button className="btn primary assist-btn" onClick={startAssistedLogin}>
+                  <LogIn size={16} /> Abrir ventana de login
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="assist-waiting">
+                  <Loader2 size={26} className="spin" />
+                  <p>
+                    Inicia sesión en la ventana que se abrió.
+                    <br />
+                    Detectaré la sesión automáticamente…
+                  </p>
+                </div>
+                <button className="btn ghost assist-btn" onClick={cancelAssistedLogin}>
+                  Cancelar
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {addTab === "browser" && (
           <div className="browser-pick">
             {browserLoading ? (
               <div className="browser-empty">
@@ -433,7 +466,9 @@ export function AccountsView({
               está abierto, InstaVault lo cierra para poder leer las cookies y reintenta.
             </span>
           </div>
-        ) : (
+        )}
+
+        {addTab === "manual" && (
           <div className="form">
             <label className="field">
               <span>Usuario</span>

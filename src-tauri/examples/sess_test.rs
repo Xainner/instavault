@@ -1,5 +1,6 @@
-//! Diagnóstico: captura real + parseo + is_minimally_valid, imprimiendo cada paso.
-use instavault_lib::instagram::cdp_login::CdpSession;
+//! Diagnóstico e2e: captura CDP + validación DESDE la página (flujo real nuevo).
+//! Ejecutar: cargo run --example sess_test
+use instavault_lib::instagram::cdp_login::{self, CdpSession};
 use std::time::Duration;
 
 fn main() {
@@ -7,22 +8,32 @@ fn main() {
     std::thread::sleep(Duration::from_millis(600));
     let mut sess = match CdpSession::launch() {
         Ok(s) => s,
-        Err(e) => { println!("LAUNCH FALLO: {e:#}"); return; }
+        Err(e) => {
+            println!("LAUNCH FALLO: {e:#}");
+            return;
+        }
     };
-    if let Err(e) = sess.wait_ready() { println!("WAIT FALLO: {e:#}"); return; }
+    if let Err(e) = sess.wait_ready() {
+        println!("WAIT FALLO: {e:#}");
+        return;
+    }
     std::thread::sleep(Duration::from_millis(800));
     let header = match sess.try_capture() {
         Ok(Some(h)) => h,
-        Ok(None) => { println!("sin sessionid"); return; }
-        Err(e) => { println!("CAPTURE FALLO: {e:#}"); return; }
+        Ok(None) => {
+            println!("sin sessionid (no hay login en el perfil)");
+            return;
+        }
+        Err(e) => {
+            println!("CAPTURE FALLO: {e:#}");
+            return;
+        }
     };
-    println!("HEADER: {}", header);
-    let s = instavault_lib::instagram::client::Session::from_cookie_header(&header);
-    println!("header contiene sessionid=: {}", s.cookie_header.contains("sessionid="));
-    println!("header contiene __: {}", s.cookie_header.contains("__"));
-    println!("csrftoken: len {}", s.csrftoken.len());
-    println!("ds_user_id: {}", s.ds_user_id);
-    println!("cookie_header: {}", s.cookie_header);
-    println!("valid: {}", s.is_minimally_valid());
+    println!("cookies capturadas ({} bytes)", header.len());
+    match cdp_login::current_user_via_page(sess.port()) {
+        Ok(Some(u)) => println!("VALIDADO DESDE LA PAGINA -> @{u}"),
+        Ok(None) => println!("la pagina no reporta usuario logueado"),
+        Err(e) => println!("VALIDACION FALLO: {e:#}"),
+    }
     sess.shutdown();
 }

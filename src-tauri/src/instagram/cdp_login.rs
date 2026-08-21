@@ -62,7 +62,10 @@ impl CdpSession {
                 ),
                 "--no-first-run",
                 "--no-default-browser-check",
-                "https://www.instagram.com/accounts/login/",
+                // Logout primero: limpia sesiones viejas del perfil (que
+                // quedan con otro UA y la API las rechaza con
+                // "useragent mismatch"). Redirige a login automáticamente.
+                "https://www.instagram.com/accounts/logout/",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -123,6 +126,11 @@ impl CdpSession {
     /// Indica si el proceso del navegador sigue vivo.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Puerto CDP en uso.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Cierra el navegador ordenadamente.
@@ -213,6 +221,66 @@ pub fn capture_cookies(port: u16) -> Result<Option<String>> {
 #[doc(hidden)]
 pub fn http_get_json_for_test(url: &str) -> Result<serde_json::Value> {
     http_get_json(url)
+}
+
+/// Pide current_user a la página misma (fetch desde instagram.com).
+/// Devuelve el username real si la sesión del navegador es válida.
+/// Es la validación fiable: usa el UA y las cookies del navegador, no una
+/// imitación externa que Instagram rechaza con "useragent mismatch".
+pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    let expr = r#"(async () => {
+        const res = await fetch('/api/v1/accounts/current_user/?edit=true', {
+            headers: {'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'},
+            credentials: 'include'
+        });
+        const t = await res.text();
+        try {
+            const j = JSON.parse(t);
+            if (j.user && j.user.username) return {ok:true, username:j.user.username};
+            return {ok:false, msg: t.slice(0, 120)};
+        } catch(e) { return {ok:false, msg: t.slice(0, 120)}; }
+    })()"#;
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expr, "returnByValue": true, "awaitPromise": true}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout esperando current_user"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+                    let val = v
+                        .pointer("/result/result/value")
+                        .ok_or_else(|| anyhow!("current_user sin resultado"))?;
+                    let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                    if !ok {
+                        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("?");
+                        return Err(anyhow!("sesión del navegador no válida: {msg}"));
+                    }
+                    return Ok(val
+                        .get("username")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string()));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
 }
 
 /// GET HTTP mínimo que parsea la respuesta JSON.

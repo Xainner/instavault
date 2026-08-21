@@ -87,6 +87,41 @@ async fn insert_account(
         .ok_or_else(|| "error al releer la cuenta".to_string())
 }
 
+/// Inserta una cuenta cuya sesión YA fue validada desde el navegador
+/// (status "valid" directo, sin re-validar por la API móvil, que rechaza
+/// cookies web con "useragent mismatch").
+async fn insert_account_verified(
+    state: &AppState,
+    username: String,
+    cookie_header: String,
+) -> Result<AccountInfo, String> {
+    let s = Session::from_cookie_header(&cookie_header);
+    if !s.is_minimally_valid() {
+        return Err("Cookies incompletas: se requieren sessionid y csrftoken".to_string());
+    }
+    let dbl = db(state);
+    let id = dbl
+        .lock()
+        .unwrap()
+        .add_account(&username, &format!("account:{}", 0))
+        .map_err(|e| e.to_string())?;
+    creds::save_cookies(id, &cookie_header)
+        .map_err(|e| format!("No se pudieron guardar las cookies: {e}"))?;
+    dbl.lock()
+        .unwrap()
+        .set_account_status(id, "valid")
+        .map_err(|e| e.to_string())?;
+    let rows = dbl
+        .lock()
+        .unwrap()
+        .list_accounts()
+        .map_err(|e| e.to_string())?;
+    rows.iter()
+        .find(|r| r.0 == id)
+        .map(account_from_row)
+        .ok_or_else(|| "error al releer la cuenta".to_string())
+}
+
 #[tauri::command]
 pub async fn add_account(
     state: tauri::State<'_, AppState>,
@@ -220,9 +255,10 @@ pub fn login_open(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// Consulta si ya hay sesión de Instagram capturable; si sí, crea la cuenta.
 #[tauri::command]
 pub async fn login_check(state: tauri::State<'_, AppState>) -> Result<Option<AccountInfo>, String> {
-    // try_capture es bloqueante: lo corremos en un hilo aparte.
+    use crate::instagram::cdp_login;
+    // Tareas bloqueantes en hilo aparte.
     let cdp = std::sync::Arc::clone(&state.cdp);
-    let header = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+    let (header, username) = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
         let mut guard = cdp.lock().map_err(|e| e.to_string())?;
         let Some(sess) = guard.as_mut() else {
             return Err("no hay navegador de login activo".to_string());
@@ -231,16 +267,22 @@ pub async fn login_check(state: tauri::State<'_, AppState>) -> Result<Option<Acc
             *guard = None;
             return Err("la ventana de login se cerró sin completar el login".to_string());
         }
-        sess.try_capture().map_err(|e| e.to_string())
+        let header = sess
+            .try_capture()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "aún sin sessionid".to_string())?;
+        // Valida la sesión DESDE la página (mismo UA/cookies del navegador)
+        // y obtiene el username real; la API externa rechaza cookies web.
+        let username = cdp_login::current_user_via_page(sess.port())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "la sesión del navegador no está logueada".to_string())?;
+        Ok((header, username))
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    let Some(header) = header else {
-        return Ok(None); // aún sin sessionid
-    };
     // Inserta PRIMERO; solo si sale bien cierra el navegador.
-    let account = insert_account(&state, "instagram".to_string(), header).await?;
+    let account = insert_account_verified(&state, username, header).await?;
     if let Ok(mut guard) = state.cdp.lock() {
         if let Some(mut s) = guard.take() {
             s.shutdown();

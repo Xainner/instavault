@@ -25,12 +25,16 @@ pub struct CurrentUser {
 
 /// Valida/lee la sesión autenticada (falla si las cookies no son válidas).
 pub async fn current_user(ig: &IgClient, session: &Session) -> anyhow::Result<CurrentUser> {
-    let url = format!("{API_BASE}/accounts/current_user/?edit=true");
-    let resp: CurrentUserResponse = ig
-        .get_json(&url, session)
-        .await
-        .context("sesión inválida o expirada")?;
+    let body = raw_current_user(ig, session).await?;
+    let resp: CurrentUserResponse = serde_json::from_slice(&body)
+        .context("respuesta de current_user sin campo user")?;
     Ok(resp.user)
+}
+
+/// GET crudo de current_user (para diagnóstico).
+pub async fn raw_current_user(ig: &IgClient, session: &Session) -> anyhow::Result<Vec<u8>> {
+    let url = format!("{API_BASE}/accounts/current_user/?edit=true");
+    ig.get_bytes(&url, session).await
 }
 
 // ---------------------------------------------------------------------------

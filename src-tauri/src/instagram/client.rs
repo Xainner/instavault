@@ -28,14 +28,15 @@ pub struct Session {
 
 impl Session {
     /// Construye la sesión desde un header de cookies crudo, p.ej.
-    /// `sessionid=abc...; csrftoken=xyz...; ds_user_id=123; ig_did=...`
+    /// `sessionid=abc...; csrftoken=xyz...; ds_user_id=123; ig_did=...`.
+    /// Conserva el header COMPLETO (la API exige más cookies que las tres
+    /// básicas: ig_did, mid, rur, datr, ...) y solo parsea los campos clave.
     pub fn from_cookie_header(raw: &str) -> Self {
         let map = parse_cookies(raw);
         let csrftoken = map.get("csrftoken").cloned().unwrap_or_default();
         let ds_user_id = map.get("ds_user_id").cloned().unwrap_or_default();
         let sessionid = map.get("sessionid").cloned().unwrap_or_default();
-        let cookie_header =
-            format!("sessionid={sessionid}; csrftoken={csrftoken}; ds_user_id={ds_user_id};");
+        let cookie_header = raw.trim().to_string();
         Session {
             cookie_header,
             sessionid,
