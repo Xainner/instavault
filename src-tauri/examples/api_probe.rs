@@ -19,7 +19,7 @@ fn main() {
     }
     std::thread::sleep(Duration::from_secs(5)); // home cargando
 
-    for username in ["cristiano", "leomessi", "xainner_xyz_inexistente"] {
+    for username in ["cristiano", "fiochavesch", "leomessi"] {
         let path = format!("/api/v1/users/web_profile_info/?username={username}");
         match cdp_login::api_fetch_via_page(sess.port(), &path) {
             Ok(v) => {

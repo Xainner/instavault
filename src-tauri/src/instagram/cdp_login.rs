@@ -306,21 +306,63 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
     let ws_url = page_ws_url(port)?;
     let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
         .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    // Extrae el username del path para el fallback (`/{username}/`).
+    let user_json = path
+        .split("username=")
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .next()
+        .unwrap_or("")
+        .to_string();
     let expr = format!(
         r#"(async () => {{
+            const tryPath = async (path, tries) => {{
+                for (let i = 0; i < tries; i++) {{
+                    try {{
+                        const res = await fetch(path, {{
+                            headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
+                            credentials: 'include'
+                        }});
+                        const t = await res.text();
+                        if (res.status === 429 || res.status === 400) {{
+                            await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+                            continue;
+                        }}
+                        if (res.status === 403) return {{ok:false, why:'forbidden'}};
+                        if (res.status === 404) return {{ok:false, why:'notFound'}};
+                        if (res.status >= 400) return {{ok:false, why:'http'+res.status}};
+                        try {{ const j = JSON.parse(t); return {{ok:true, v:j}}; }}
+                        catch(e) {{ return {{ok:false, why:'html'}}; }}
+                    }} catch(e) {{ return {{ok:false, why:'netErr'}}; }}
+                }}
+                return {{ok:false, why:'rateLimit'}};
+            }};
             try {{
-                const res = await fetch({path:?}, {{
-                    headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
-                    credentials: 'include'
-                }});
-                const t = await res.text();
-                if (res.status === 429) return {{ok:false, why:'rateLimit'}};
-                if (res.status === 403) return {{ok:false, why:'forbidden'}};
-                if (res.status === 404) return {{ok:false, why:'notFound'}};
-                if (res.status >= 400) return {{ok:false, why:'http'+res.status}};
-                try {{ const j = JSON.parse(t); return {{ok:true, v:j}}; }}
-                catch(e) {{ return {{ok:false, why:'html'}}; }}
-            }} catch(e) {{ return {{ok:false, why:'netErr'}}; }}
+                const r = await tryPath({path:?}, 3);
+                if (r.ok) return r;
+                // El API puede devolver HTML si la página está en login/2FA.
+                // Fallback: parsear la propia pagina del perfil.
+                if (r.why === 'html' || r.why === 'http400' || r.why === 'http401' || r.why === 'rateLimit') {{
+                    const u = {user_json:?};
+                    try {{
+                        const res = await fetch('/' + u + '/', {{
+                            headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
+                            credentials: 'include'
+                        }});
+                        const t = await res.text();
+                        if (res.status === 404) return {{ok:false, why:'notFound'}};
+                        const m = t.match(/"username":"([^"]{{2,30}})"/);
+                        const mid = t.match(/"id":"([0-9]+)"/);
+                        if (m) {{
+                            const id = mid ? mid[1] : u;
+                            return {{ok:true, v:{{data:{{user:{{id: id, username: m[1], full_name: null, biography: null, profile_pic_url_hd: null, is_private: false, is_verified: false, edge_followed_by: {{count: 0}}, edge_follow: {{count: 0}}, edge_owner_to_timeline_media: {{count: 0}}}}}}}}}};
+                        }}
+                        return {{ok:false, why:'noUsername'}};
+                    }} catch(e) {{ return {{ok:false, why:'err2'}}; }}
+                }}
+                return r;
+            }} catch(e) {{ return {{ok:false, why:'scriptErr:' + e}}; }}
         }})()"#
     );
     use tungstenite::Message;
