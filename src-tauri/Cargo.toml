@@ -1,0 +1,44 @@
+[package]
+name = "instavault"
+version = "0.1.0"
+description = "InstaVault — descarga perfiles, posts, stories y highlights de Instagram con cookies"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "instavault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTP + cookies
+reqwest = { version = "0.12", features = ["json", "cookies", "stream", "rustls-tls"], default-features = false }
+# BD SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Cifrado de credenciales (cookies) en el llavero del SO
+keyring = { version = "3", features = ["windows-native"] }
+# Async runtime (tauri ya trae tokio en el runtime, pero fijamos para uso propio)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+# Logs
+log = "0.4"
+# URL parsing
+url = "2"
+# UUIDs / ids
+uuid = { version = "1", features = ["v4"] }
+# Fechas
+chrono = { version = "0.4", features = ["serde"] }
+# Errores ergonómicos
+anyhow = "1"
+# Manejo de paths multiplataforma
+dirs = "5"
