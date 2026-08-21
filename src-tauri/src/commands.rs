@@ -192,6 +192,70 @@ pub fn close_browser(browser_name: String) -> Result<u32, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Login con navegador propio (CDP)
+// ---------------------------------------------------------------------------
+
+/// Abre la ventana de login de Instagram (navegador de InstaVault).
+#[tauri::command]
+pub fn login_open(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    use crate::instagram::cdp_login::CdpSession;
+    let mut guard = state.cdp.lock().unwrap();
+    if guard.is_some() {
+        return Ok(()); // ya hay una ventana abierta
+    }
+    *guard = Some(CdpSession::launch().map_err(|e| e.to_string())?);
+    let sess = guard.as_mut().unwrap();
+    // El puerto debe quedar listo antes de devolver el control a la UI.
+    sess.wait_ready().map_err(|e| {
+        *guard = None;
+        e.to_string()
+    })
+}
+
+/// Consulta si ya hay sesión de Instagram capturable; si sí, crea la cuenta.
+#[tauri::command]
+pub async fn login_check(state: tauri::State<'_, AppState>) -> Result<Option<AccountInfo>, String> {
+    // try_capture es bloqueante: lo corremos en un hilo aparte.
+    let cdp = std::sync::Arc::clone(&state.cdp);
+    let header = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        let mut guard = cdp.lock().map_err(|e| e.to_string())?;
+        let Some(sess) = guard.as_mut() else {
+            return Err("no hay navegador de login activo".to_string());
+        };
+        if !sess.is_alive() {
+            *guard = None;
+            return Err("la ventana de login se cerró sin completar el login".to_string());
+        }
+        sess.try_capture().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let Some(header) = header else {
+        return Ok(None); // aún sin sessionid
+    };
+    // Inserta PRIMERO; solo si sale bien cierra el navegador.
+    let account = insert_account(&state, "instagram".to_string(), header).await?;
+    if let Ok(mut guard) = state.cdp.lock() {
+        if let Some(mut s) = guard.take() {
+            s.shutdown();
+        }
+    }
+    Ok(Some(account))
+}
+
+/// Cancela el flujo de login y cierra el navegador.
+#[tauri::command]
+pub fn login_cancel(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut guard) = state.cdp.lock() {
+        if let Some(mut s) = guard.take() {
+            s.shutdown();
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Perfiles
 // ---------------------------------------------------------------------------
 

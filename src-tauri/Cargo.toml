@@ -46,3 +46,5 @@ aead = "0.5"
 anyhow = "1"
 # Manejo de paths multiplataforma
 dirs = "5"
+# Cliente WebSocket para hablar CDP con el navegador (captura de cookies)
+tungstenite = "0.24"

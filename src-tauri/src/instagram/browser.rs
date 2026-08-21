@@ -99,6 +99,11 @@ fn scan_chromium(user_data: &Path, browser: &str, out: &mut Vec<BrowserProfile>)
 }
 
 /// Clave AES-256 desde "Local State" (base64 v10/v11 + DPAPI).
+#[doc(hidden)]
+pub fn load_key_for_test(local_state: &Path) -> Result<[u8; 32]> {
+    load_master_key(local_state)
+}
+
 fn load_master_key(local_state: &Path) -> Result<[u8; 32]> {
     let text = std::fs::read_to_string(local_state)
         .with_context(|| format!("no se pudo leer {:?}", local_state))?;
@@ -131,6 +136,12 @@ fn load_master_key(local_state: &Path) -> Result<[u8; 32]> {
     let mut k = [0u8; 32];
     k.copy_from_slice(&key);
     Ok(k)
+}
+
+/// Descifra un valor de cookie (para diagnóstico y pruebas).
+#[doc(hidden)]
+pub fn decrypt_for_test(value: &[u8], key: &[u8; 32]) -> Result<String> {
+    decrypt_cookie_value(value, key)
 }
 
 fn decrypt_cookie_value(value: &[u8], key: &[u8; 32]) -> Result<String> {
@@ -194,38 +205,55 @@ pub fn instagram_cookie_header(bp: &BrowserProfile) -> Result<CookieExtract> {
     let result = (|| -> Result<CookieExtract> {
         let conn = rusqlite::Connection::open(&tmp)?;
         let mut stmt = conn.prepare(
-            "SELECT host_key, name, value FROM cookies WHERE host_key LIKE '%instagram.com'",
+            "SELECT host_key, name, value, encrypted_value FROM cookies WHERE host_key LIKE '%instagram.com'",
         )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-        for (host, name, raw) in rows {
+        let mut ig_rows = 0usize;
+        let mut decrypt_fail = 0usize;
+        for (host, name, plain, enc) in rows {
+            ig_rows += 1;
+            // El valor real vive cifrado en encrypted_value; `value` (texto
+            // plano) suele venir vacío en Chrome moderno.
+            let raw: Vec<u8> = if !enc.is_empty() {
+                enc
+            } else {
+                plain.into_bytes()
+            };
             if raw.is_empty() {
                 continue;
             }
-            // Prefiere hosts sin www si ambos existen (escribir después = ganar)
-            if host.starts_with("www.") {
-                if map.contains_key(&name) {
+            let decrypted = match decrypt_cookie_value(&raw, &key) {
+                Ok(v) => v,
+                Err(_) => {
+                    decrypt_fail += 1;
                     continue;
                 }
+            };
+            // Prefiere el host sin "www." si ambos existen.
+            let is_www = host.starts_with("www.");
+            if is_www && map.contains_key(&name) {
+                continue;
             }
-            match decrypt_cookie_value(&raw, &key) {
-                Ok(v) => {
-                    map.insert(name, v);
-                }
-                Err(_) => continue,
-            }
+            map.insert(name, decrypted);
         }
 
         if !map.contains_key("sessionid") {
+            if decrypt_fail > 0 && ig_rows > 0 {
+                return Err(anyhow!(
+                    "este navegador cifra sus cookies con App-Bound Encryption (Chrome 127+) y no se pueden descifrar desde otra app. Usa la pestaña \"Login asistido\"."
+                ));
+            }
             return Err(anyhow!(
                 "no hay cookie sessionid de Instagram en este perfil (¿estás logueado en ese navegador?)"
             ));

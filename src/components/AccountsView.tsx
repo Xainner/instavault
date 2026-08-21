@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   BadgeCheck,
@@ -7,6 +7,7 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  LogIn,
   Plus,
   RefreshCw,
   ShieldAlert,
@@ -20,6 +21,9 @@ import {
   deleteAccount,
   importBrowserAccount,
   listBrowserProfiles,
+  loginCancel,
+  loginCheck,
+  loginOpen,
   type BrowserProfile,
   validateAccount,
 } from "../lib/api";
@@ -57,11 +61,63 @@ export function AccountsView({
   onChanged: () => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
-  const [addTab, setAddTab] = useState<"browser" | "manual">("browser");
+  const [addTab, setAddTab] = useState<"browser" | "manual" | "assisted">("browser");
   const [confirm, setConfirm] = useState<AccountInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [verifying, setVerifying] = useState<number | null>(null);
   const { toast } = useToast();
+
+  // Login asistido (CDP)
+  const [assistState, setAssistState] = useState<"idle" | "waiting" | "capturing">("idle");
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
+  useEffect(() => stopPolling, []);
+
+  const startAssistedLogin = async () => {
+    setErr(null);
+    try {
+      await loginOpen();
+      setAssistState("waiting");
+      stopPolling();
+      pollRef.current = setInterval(async () => {
+        try {
+          const acc = await loginCheck();
+          if (acc) {
+            stopPolling();
+            setAssistState("idle");
+            toast("success", `@${acc.username} importada desde el navegador`);
+            setAddOpen(false);
+            setAccountId(acc.id);
+            onChanged();
+          }
+        } catch (e) {
+          // Error fatal (navegador cerrado, fallo de inserción): abortar.
+          stopPolling();
+          setAssistState("idle");
+          setErr(String(e).replace(/^.*"([^"]+)".*$/, "$1"));
+        }
+      }, 3000);
+    } catch (e) {
+      setAssistState("idle");
+      setErr(String(e));
+    }
+  };
+
+  const cancelAssistedLogin = async () => {
+    stopPolling();
+    try {
+      await loginCancel();
+    } finally {
+      setAssistState("idle");
+    }
+  };
 
   // Modal alta
   const [username, setUsername] = useState("");
@@ -277,11 +333,17 @@ export function AccountsView({
       >
         <div className="modal-tabs">
           <button
+            className={`modal-tab ${addTab === "assisted" ? "on" : ""}`}
+            onClick={() => setAddTab("assisted")}
+          >
+            <LogIn size={14} /> Login asistido
+            <span className="tab-badge">recomendado</span>
+          </button>
+          <button
             className={`modal-tab ${addTab === "browser" ? "on" : ""}`}
             onClick={() => setAddTab("browser")}
           >
             <Globe size={14} /> Desde el navegador
-            <span className="tab-badge">recomendado</span>
           </button>
           <button
             className={`modal-tab ${addTab === "manual" ? "on" : ""}`}
@@ -290,6 +352,41 @@ export function AccountsView({
             <KeyRound size={14} /> Cookies manuales
           </button>
         </div>
+
+        {addTab === "assisted" && (
+          <div className="assist">
+            {assistState === "idle" ? (
+              <>
+                <div className="assist-intro">
+                  <LogIn size={26} />
+                  <p>
+                    InstaVault abre una ventana de Chrome propia donde inicias sesión en
+                    Instagram. Las cookies se capturan automáticamente al terminar y el
+                    navegador se cierra solo.
+                  </p>
+                </div>
+                <button className="btn-primary assist-btn" onClick={startAssistedLogin}>
+                  <LogIn size={16} /> Abrir ventana de login
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="assist-waiting">
+                  <Loader2 size={26} className="spin" />
+                  <p>
+                    Inicia sesión en la ventana de Chrome que se abrió.
+                    <br />
+                    Detectaré la sesión automáticamente…
+                  </p>
+                </div>
+                <button className="btn-ghost assist-btn" onClick={cancelAssistedLogin}>
+                  Cancelar
+                </button>
+              </>
+            )}
+            {err && <p className="form-err">{err}</p>}
+          </div>
+        )}
 
         {addTab === "browser" ? (
           <div className="browser-pick">

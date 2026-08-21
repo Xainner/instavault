@@ -13,6 +13,8 @@ pub struct AppState {
     pub db: Arc<Mutex<db::Db>>,
     pub data_dir: PathBuf, // donde se guardan las descargas (accounts/{user}/...)
     pub ig: Arc<IgClient>,
+    /// Navegador de login activo (flujo CDP), si hay uno en curso.
+    pub cdp: Arc<Mutex<Option<instagram::cdp_login::CdpSession>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,18 +33,22 @@ pub fn run() {
                 db: Arc::new(Mutex::new(database)),
                 data_dir: dl_dir,
                 ig: Arc::new(ig),
+                cdp: Arc::new(Mutex::new(None)),
             };
             app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-                    commands::add_account,
-                    commands::validate_account,
-                    commands::list_accounts,
-                    commands::delete_account,
-                    commands::list_browser_profiles,
-                    commands::import_browser_account,
-                    commands::close_browser,
+            commands::add_account,
+            commands::validate_account,
+            commands::list_accounts,
+            commands::delete_account,
+            commands::list_browser_profiles,
+            commands::import_browser_account,
+            commands::close_browser,
+            commands::login_open,
+            commands::login_check,
+            commands::login_cancel,
                     commands::fetch_profile,
                     commands::list_profiles,
                     commands::delete_profile,

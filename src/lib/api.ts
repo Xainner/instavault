@@ -55,3 +55,8 @@ export const listBrowserProfiles = () =>
 
 export const importBrowserAccount = (index: number) =>
   invoke<AccountInfo>("import_browser_account", { index });
+
+// Login asistido (navegador propio de InstaVault + CDP)
+export const loginOpen = () => invoke<void>("login_open");
+export const loginCheck = () => invoke<AccountInfo | null>("login_check");
+export const loginCancel = () => invoke<void>("login_cancel");

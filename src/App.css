@@ -1229,6 +1229,41 @@
   color: #a78bfa;
 }
 
+/* ===== Login asistido (CDP) ===== */
+.assist {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.assist-intro,
+.assist-waiting {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--text-dim);
+  padding: 18px 8px;
+}
+
+.assist-intro p,
+.assist-waiting p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 380px;
+}
+
+.assist-intro svg {
+  color: var(--accent);
+}
+
+.assist-btn {
+  align-self: center;
+  min-width: 220px;
+}
+
 /* ===== Selección de navegador ===== */
 .browser-pick {
   display: flex;
