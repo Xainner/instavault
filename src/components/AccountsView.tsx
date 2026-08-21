@@ -384,7 +384,6 @@ export function AccountsView({
                 </button>
               </>
             )}
-            {err && <p className="form-err">{err}</p>}
           </div>
         )}
 

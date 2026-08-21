@@ -217,17 +217,27 @@ pub fn capture_cookies(port: u16) -> Result<Option<String>> {
     Ok(Some(parts.join("; ")))
 }
 
-/// GET HTTP mínimo que parsea la respuesta JSON (expuesto para diagnóstico).
+/// URL actual de la primera página (diagnóstico).
 #[doc(hidden)]
-pub fn http_get_json_for_test(url: &str) -> Result<serde_json::Value> {
-    http_get_json(url)
+pub fn current_url_for_test(port: u16) -> Result<String> {
+    let resp = http_get_json(&format!("http://127.0.0.1:{port}/json/list"))?;
+    let pages = resp
+        .as_array()
+        .ok_or_else(|| anyhow!("sin lista de páginas"))?;
+    for p in pages {
+        if p.get("type").and_then(|t| t.as_str()) == Some("page") {
+            let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            if !url.is_empty() {
+                return Ok(url.to_string());
+            }
+        }
+    }
+    Err(anyhow!("no se encontró ninguna página"))
 }
 
-/// Pide current_user a la página misma (fetch desde instagram.com).
-/// Devuelve el username real si la sesión del navegador es válida.
-/// Es la validación fiable: usa el UA y las cookies del navegador, no una
-/// imitación externa que Instagram rechaza con "useragent mismatch".
-pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
+/// Ejecuta el fetch de validación y devuelve el texto crudo (diagnóstico).
+#[doc(hidden)]
+pub fn raw_fetch_for_test(port: u16) -> Result<String> {
     let ws_url = page_ws_url(port)?;
     let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
         .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
@@ -236,12 +246,7 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
             headers: {'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'},
             credentials: 'include'
         });
-        const t = await res.text();
-        try {
-            const j = JSON.parse(t);
-            if (j.user && j.user.username) return {ok:true, username:j.user.username};
-            return {ok:false, msg: t.slice(0, 120)};
-        } catch(e) { return {ok:false, msg: t.slice(0, 120)}; }
+        return res.status + ' :: ' + (await res.text()).slice(0, 200);
     })()"#;
     use tungstenite::Message;
     ws.send(Message::Text(
@@ -253,7 +258,91 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
         .to_string(),
     ))
     .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+                    return Ok(v
+                        .pointer("/result/result/value")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
+}
+
+/// GET HTTP mínimo que parsea la respuesta JSON (expuesto para diagnóstico).
+#[doc(hidden)]
+pub fn http_get_json_for_test(url: &str) -> Result<serde_json::Value> {
+    http_get_json(url)
+}
+
+/// Pide current_user a la página misma (fetch desde instagram.com).
+/// Devuelve el username real si la sesión del navegador es válida.
+/// Estrategia: primero `/web/api/v1` (API nueva de la web, que devuelve JSON);
+/// si no, parsea el HTML de `/accounts/edit/` (página del propio perfil).
+/// La API vieja (`/api/v1`) ya devuelve HTML en la web actual, no JSON.
+pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    let expr = r#"(async () => {
+        async function tryFetch(url) {
+            try {
+                const res = await fetch(url, {
+                    headers: {'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'},
+                    credentials: 'include'
+                });
+                const t = await res.text();
+                if (res.status === 401) return {ok:false, why:'noAuth'};
+                try {
+                    const j = JSON.parse(t);
+                    if (j.user && j.user.username) return {ok:true, username:j.user.username};
+                    if (j.username) return {ok:true, username:j.username};
+                    return {ok:false, why:'noJson'};
+                } catch(e) { return {ok:false, why:'html'}; }
+            } catch(e) { return {ok:false, why:'err'}; }
+        }
+        // 1) API web nueva
+        let r = await tryFetch('/web/api/v1/accounts/current_user/?edit=true');
+        if (r.ok) return r;
+        // 2) API vieja (algunos entornos aun la sirven)
+        r = await tryFetch('/api/v1/accounts/current_user/?edit=true');
+        if (r.ok) return r;
+        // 3) Pagina del propio perfil: extrae el username de los datos embebidos
+        try {
+            const res = await fetch('/accounts/edit/', {credentials:'include'});
+            const t = await res.text();
+            const m = t.match(/"username":"([^"]{3,30})"/);
+            if (m) {
+                // Verifica que no sea la pagina de login
+                const login = t.includes('password') && t.includes('username');
+                return login ? {ok:false, why:'loginPage'} : {ok:true, username:m[1]};
+            }
+            return {ok:false, why:'noUsername'};
+        } catch(e) { return {ok:false, why:'err2'}; }
+    })()"#;
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expr, "returnByValue": true, "awaitPromise": true}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if Instant::now() >= deadline {
             return Err(anyhow!("timeout esperando current_user"));
@@ -267,9 +356,11 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
                         .pointer("/result/result/value")
                         .ok_or_else(|| anyhow!("current_user sin resultado"))?;
                     let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                    let why = val.get("why").and_then(|m| m.as_str()).unwrap_or("?");
                     if !ok {
-                        let msg = val.get("msg").and_then(|m| m.as_str()).unwrap_or("?");
-                        return Err(anyhow!("sesión del navegador no válida: {msg}"));
+                        return Err(anyhow!(
+                            "sesión del navegador no válida ({why}); vuelve a iniciar sesión en la ventana"
+                        ));
                     }
                     return Ok(val
                         .get("username")
