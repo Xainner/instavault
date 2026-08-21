@@ -42,3 +42,16 @@ export const downloadProfile = (
   kind: Kind,
   concurrency = 4,
 ) => invoke<[number, number]>("download_profile", { accountId, profileId, kind, concurrency });
+
+// Navegador
+export interface BrowserProfile {
+  browser: string;
+  profile: string;
+  cookiesPath: string;
+}
+
+export const listBrowserProfiles = () =>
+  invoke<BrowserProfile[]>("list_browser_profiles");
+
+export const importBrowserAccount = (index: number) =>
+  invoke<AccountInfo>("import_browser_account", { index });

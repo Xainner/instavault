@@ -1,0 +1,101 @@
+/* ===== InstaVault · sistema de diseño ===== */
+
+:root {
+  --bg: #0b0d12;
+  --surface: #12151d;
+  --surface-2: #1a1f2b;
+  --surface-3: #232a3a;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-2: rgba(255, 255, 255, 0.14);
+  --text: #f2f4f8;
+  --text-2: #9aa3b5;
+  --text-3: #5c6577;
+  --grad: linear-gradient(45deg, #f58529, #dd2a7b 55%, #8134af);
+  --grad-soft:
+    radial-gradient(1100px 560px at 85% -10%, rgba(221, 42, 123, 0.13), transparent 60%),
+    radial-gradient(900px 520px at -15% 110%, rgba(129, 52, 175, 0.11), transparent 60%);
+  --ok: #2dd4a7;
+  --warn: #f5b445;
+  --err: #f0506e;
+  --r-lg: 20px;
+  --r-md: 14px;
+  --r-sm: 10px;
+  --shadow-lg: 0 24px 70px rgba(0, 0, 0, 0.55);
+  --shadow-md: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+::selection {
+  background: rgba(221, 42, 123, 0.35);
+}
+
+/* Scrollbars */
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: content-box;
+}
+
+input,
+textarea,
+button {
+  font-family: inherit;
+}
+
+img {
+  display: block;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(45, 212, 167, 0.5);
+  }
+  60% {
+    box-shadow: 0 0 0 5px rgba(45, 212, 167, 0);
+  }
+}
