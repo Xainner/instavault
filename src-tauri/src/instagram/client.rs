@@ -21,6 +21,7 @@ const ANDROID_UA: &str = concat!(
 #[derive(Debug, Clone)]
 pub struct Session {
     pub cookie_header: String,
+    pub sessionid: String,
     pub csrftoken: String,
     pub ds_user_id: String,
 }
@@ -37,16 +38,15 @@ impl Session {
             format!("sessionid={sessionid}; csrftoken={csrftoken}; ds_user_id={ds_user_id};");
         Session {
             cookie_header,
+            sessionid,
             csrftoken,
             ds_user_id,
         }
     }
 
-    /// Válida mínimo: necesita sessionid y csrftoken.
+    /// Válida mínimo: necesita sessionid y csrftoken no vacíos.
     pub fn is_minimally_valid(&self) -> bool {
-        self.cookie_header.contains("sessionid=")
-            && self.cookie_header.contains("__") // id formato "x:y" o largo
-            && !self.csrftoken.is_empty()
+        !self.sessionid.is_empty() && !self.csrftoken.is_empty()
     }
 }
 
