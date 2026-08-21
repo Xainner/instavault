@@ -365,7 +365,7 @@ export function AccountsView({
                     navegador se cierra solo.
                   </p>
                 </div>
-                <button className="btn-primary assist-btn" onClick={startAssistedLogin}>
+                <button className="btn primary assist-btn" onClick={startAssistedLogin}>
                   <LogIn size={16} /> Abrir ventana de login
                 </button>
               </>
@@ -379,45 +379,12 @@ export function AccountsView({
                     Detectaré la sesión automáticamente…
                   </p>
                 </div>
-                <button className="btn-ghost assist-btn" onClick={cancelAssistedLogin}>
-                  Cancelar
-                </button>
-              </>
-            )}
-            {err && <p className="form-err">{err}</p>}
-          </div>
-        )}
-
-        {addTab === "assisted" && (
-          <div className="assist">
-            {assistState === "idle" ? (
-              <>
-                <div className="assist-intro">
-                  <LogIn size={26} />
-                  <p>
-                    InstaVault abre una ventana propia donde inicias sesión en Instagram.
-                    Las cookies se capturan automáticamente al terminar.
-                  </p>
-                </div>
-                <button className="btn primary assist-btn" onClick={startAssistedLogin}>
-                  <LogIn size={16} /> Abrir ventana de login
-                </button>
-              </>
-            ) : (
-              <>
-                <div className="assist-waiting">
-                  <Loader2 size={26} className="spin" />
-                  <p>
-                    Inicia sesión en la ventana que se abrió.
-                    <br />
-                    Detectaré la sesión automáticamente…
-                  </p>
-                </div>
                 <button className="btn ghost assist-btn" onClick={cancelAssistedLogin}>
                   Cancelar
                 </button>
               </>
             )}
+            {err && <p className="form-err">{err}</p>}
           </div>
         )}
 

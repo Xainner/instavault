@@ -258,7 +258,7 @@ pub async fn login_check(state: tauri::State<'_, AppState>) -> Result<Option<Acc
     use crate::instagram::cdp_login;
     // Tareas bloqueantes en hilo aparte.
     let cdp = std::sync::Arc::clone(&state.cdp);
-    let (header, username) = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>, String> {
         let mut guard = cdp.lock().map_err(|e| e.to_string())?;
         let Some(sess) = guard.as_mut() else {
             return Err("no hay navegador de login activo".to_string());
@@ -267,20 +267,26 @@ pub async fn login_check(state: tauri::State<'_, AppState>) -> Result<Option<Acc
             *guard = None;
             return Err("la ventana de login se cerró sin completar el login".to_string());
         }
-        let header = sess
-            .try_capture()
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "aún sin sessionid".to_string())?;
+        // Sin sessionid todavía NO es un error: el usuario aún puede estar
+        // escribiendo credenciales. Devuelve None y el frontend sigue
+        // esperando hasta que aparezca.
+        let header = match sess.try_capture().map_err(|e| e.to_string())? {
+            Some(h) => h,
+            None => return Ok(None),
+        };
         // Valida la sesión DESDE la página (mismo UA/cookies del navegador)
         // y obtiene el username real; la API externa rechaza cookies web.
         let username = cdp_login::current_user_via_page(sess.port())
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "la sesión del navegador no está logueada".to_string())?;
-        Ok((header, username))
+        Ok(Some((header, username)))
     })
     .await
     .map_err(|e| e.to_string())??;
 
+    let Some((header, username)) = result else {
+        return Ok(None); // sigue esperando: aún no hay sessionid
+    };
     // Inserta PRIMERO; solo si sale bien cierra el navegador.
     let account = insert_account_verified(&state, username, header).await?;
     if let Ok(mut guard) = state.cdp.lock() {
