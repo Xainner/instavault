@@ -1,7 +1,7 @@
 mod commands;
 mod creds;
 mod db;
-mod instagram;
+pub mod instagram;
 
 use instagram::client::IgClient;
 use std::path::PathBuf;
@@ -36,19 +36,22 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::add_account,
-            commands::validate_account,
-            commands::list_accounts,
-            commands::delete_account,
-            commands::fetch_profile,
-            commands::list_profiles,
-            commands::delete_profile,
-            commands::get_media,
-            commands::sync_posts,
-            commands::sync_stories,
-            commands::sync_highlights,
-            commands::download_profile,
-        ])
+                    commands::add_account,
+                    commands::validate_account,
+                    commands::list_accounts,
+                    commands::delete_account,
+                    commands::list_browser_profiles,
+                    commands::import_browser_account,
+                    commands::close_browser,
+                    commands::fetch_profile,
+                    commands::list_profiles,
+                    commands::delete_profile,
+                    commands::get_media,
+                    commands::sync_posts,
+                    commands::sync_stories,
+                    commands::sync_highlights,
+                    commands::download_profile,
+                ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

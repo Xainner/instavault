@@ -38,6 +38,10 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 # Fechas
 chrono = { version = "0.4", features = ["serde"] }
+# Extracción de cookies del navegador (Chromium)
+base64 = "0.22"
+aes-gcm = "0.10"
+aead = "0.5"
 # Errores ergonómicos
 anyhow = "1"
 # Manejo de paths multiplataforma

@@ -47,9 +47,9 @@ fn account_from_row(r: &(i64, String, String, String, Option<i64>)) -> AccountIn
 // Cuentas
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn add_account(
-    state: tauri::State<'_, AppState>,
+/// Inserta una cuenta (valida la sesión contra la API y persiste cookies).
+async fn insert_account(
+    state: &AppState,
     username: String,
     cookie_header: String,
 ) -> Result<AccountInfo, String> {
@@ -58,23 +58,17 @@ pub async fn add_account(
         return Err("Cookies incompletas: se requieren sessionid y csrftoken".to_string());
     }
     let ig = state.ig.clone();
-    let status = match api::current_user(&ig, &s).await {
-        Ok(me) => {
-            if !me.username.is_empty() && me.username.to_lowercase() != username.to_lowercase() {
-                return Err(format!(
-                    "Las cookies pertenecen a @{}, no a @{}",
-                    me.username, username
-                ));
-            }
-            "valid"
-        }
-        Err(_) => "invalid",
+    let (status, real_username) = match api::current_user(&ig, &s).await {
+        Ok(me) if !me.username.is_empty() => ("valid", Some(me.username)),
+        Ok(_) => ("valid", None),
+        Err(_) => ("invalid", None),
     };
-    let dbl = db(&state);
+    let username = real_username.unwrap_or(username);
+    let dbl = db(state);
     let id = dbl
         .lock()
         .unwrap()
-        .add_account(&username, &format!("account:{}", 0))
+        .add_account(&username, &format!("account:{}" , 0))
         .map_err(|e| e.to_string())?;
     creds::save_cookies(id, &cookie_header)
         .map_err(|e| format!("No se pudieron guardar las cookies: {e}"))?;
@@ -91,6 +85,15 @@ pub async fn add_account(
         .find(|r| r.0 == id)
         .map(account_from_row)
         .ok_or_else(|| "error al releer la cuenta".to_string())
+}
+
+#[tauri::command]
+pub async fn add_account(
+    state: tauri::State<'_, AppState>,
+    username: String,
+    cookie_header: String,
+) -> Result<AccountInfo, String> {
+    insert_account(&state, username, cookie_header).await
 }
 
 #[tauri::command]
@@ -136,6 +139,56 @@ pub fn delete_account(state: tauri::State<'_, AppState>, account_id: i64) -> Res
         .unwrap()
         .delete_account(account_id)
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Conexión desde navegador (Chrome/Edge/Brave/Opera)
+// ---------------------------------------------------------------------------
+
+/// Lista los perfiles de navegadores Chromium detectados con cookies.
+#[tauri::command]
+pub fn list_browser_profiles() -> Result<Vec<crate::instagram::browser::BrowserProfile>, String> {
+    Ok(crate::instagram::browser::discover())
+}
+
+/// Extrae la sesión de Instagram de un perfil de navegador y crea la cuenta.
+/// Si la base de cookies está bloqueada (navegador abierto), la cierra y reintenta.
+#[tauri::command]
+pub async fn import_browser_account(
+    state: tauri::State<'_, AppState>,
+    index: usize,
+) -> Result<AccountInfo, String> {
+    use crate::instagram::browser;
+    let profiles = browser::discover();
+    let bp = profiles
+        .get(index)
+        .ok_or_else(|| "perfil de navegador no encontrado".to_string())?;
+    let extract = browser::instagram_cookie_header(bp).or_else(|e| {
+        let msg = e.to_string();
+        let blocked = msg.contains("no se pudo leer la base de cookies");
+        if !blocked {
+            return Err(msg);
+        }
+        // Cierra el navegador para liberar el archivo y reintenta una vez.
+        let _ = browser::close_browser(&bp.browser);
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        browser::instagram_cookie_header(bp).map_err(|e| e.to_string())
+    })?;
+    insert_account(
+        &state,
+        extract
+            .ds_user_id
+            .map(|d| format!("usuario_{d}"))
+            .unwrap_or_else(|| "instagram".to_string()),
+        extract.header,
+    )
+    .await
+}
+
+/// Cierra todas las instancias de un navegador (util para desbloquear cookies).
+#[tauri::command]
+pub fn close_browser(browser_name: String) -> Result<u32, String> {
+    crate::instagram::browser::close_browser(&browser_name).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
