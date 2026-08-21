@@ -140,22 +140,34 @@ impl CdpSession {
     }
 }
 
-/// Obtiene la URL WebSocket de la primera página abierta.
+/// Obtiene la URL WebSocket de la primera página de Instagram abierta.
+/// Prefiere páginas cuyo URL contenga instagram.com (evita pestañas
+/// auxiliares/about:blank que el navegador abra durante el login).
 fn page_ws_url(port: u16) -> Result<String> {
     let resp = http_get_json(&format!("http://127.0.0.1:{port}/json/list"))?;
     let pages = resp
         .as_array()
-        .ok_or_else(|| anyhow!("respuesta /json/list no es un arreglo"))?
-        .iter()
-        .filter(|t| t.get("type").and_then(|t| t.as_str()) == Some("page"))
-        .collect::<Vec<_>>();
-    let page = pages
-        .first()
-        .ok_or_else(|| anyhow!("el navegador no tiene páginas abiertas"))?;
-    page.get("webSocketDebuggerUrl")
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("página sin webSocketDebuggerUrl"))
+        .ok_or_else(|| anyhow!("respuesta /json/list no es un arreglo"))?;
+    let mut fallback: Option<String> = None;
+    for t in pages {
+        if t.get("type").and_then(|t| t.as_str()) != Some("page") {
+            continue;
+        }
+        let ws = t
+            .get("webSocketDebuggerUrl")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+        let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if url.contains("instagram.com") {
+            if let Some(ws) = ws {
+                return Ok(ws);
+            }
+        }
+        if fallback.is_none() {
+            fallback = ws;
+        }
+    }
+    fallback.ok_or_else(|| anyhow!("el navegador no tiene páginas abiertas"))
 }
 
 /// Conecta al CDP, pide las cookies de Instagram y arma el header.
@@ -296,41 +308,43 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
     let ws_url = page_ws_url(port)?;
     let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
         .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    // JS con try/catch GLOBAL: siempre devuelve {ok:...}, nunca lanza.
     let expr = r#"(async () => {
-        async function tryFetch(url) {
-            try {
-                const res = await fetch(url, {
-                    headers: {'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'},
-                    credentials: 'include'
-                });
-                const t = await res.text();
-                if (res.status === 401) return {ok:false, why:'noAuth'};
-                try {
-                    const j = JSON.parse(t);
-                    if (j.user && j.user.username) return {ok:true, username:j.user.username};
-                    if (j.username) return {ok:true, username:j.username};
-                    return {ok:false, why:'noJson'};
-                } catch(e) { return {ok:false, why:'html'}; }
-            } catch(e) { return {ok:false, why:'err'}; }
-        }
-        // 1) API web nueva
-        let r = await tryFetch('/web/api/v1/accounts/current_user/?edit=true');
-        if (r.ok) return r;
-        // 2) API vieja (algunos entornos aun la sirven)
-        r = await tryFetch('/api/v1/accounts/current_user/?edit=true');
-        if (r.ok) return r;
-        // 3) Pagina del propio perfil: extrae el username de los datos embebidos
         try {
-            const res = await fetch('/accounts/edit/', {credentials:'include'});
-            const t = await res.text();
-            const m = t.match(/"username":"([^"]{3,30})"/);
-            if (m) {
-                // Verifica que no sea la pagina de login
-                const login = t.includes('password') && t.includes('username');
-                return login ? {ok:false, why:'loginPage'} : {ok:true, username:m[1]};
+            async function tryFetch(url) {
+                try {
+                    const res = await fetch(url, {
+                        headers: {'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'},
+                        credentials: 'include'
+                    });
+                    const t = await res.text();
+                    if (res.status === 401) return {ok:false, why:'noAuth'};
+                    try {
+                        const j = JSON.parse(t);
+                        if (j.user && j.user.username) return {ok:true, username:j.user.username};
+                        if (j.username) return {ok:true, username:j.username};
+                        return {ok:false, why:'noJson'};
+                    } catch(e) { return {ok:false, why:'html'}; }
+                } catch(e) { return {ok:false, why:'err'}; }
             }
-            return {ok:false, why:'noUsername'};
-        } catch(e) { return {ok:false, why:'err2'}; }
+            // 1) API web nueva
+            let r = await tryFetch('/web/api/v1/accounts/current_user/?edit=true');
+            if (r.ok) return r;
+            // 2) API vieja (algunos entornos aun la sirven)
+            r = await tryFetch('/api/v1/accounts/current_user/?edit=true');
+            if (r.ok) return r;
+            // 3) Pagina del propio perfil: extrae el username de los datos embebidos
+            try {
+                const res = await fetch('/accounts/edit/', {credentials:'include'});
+                const t = await res.text();
+                const m = t.match(/"username":"([^"]{3,30})"/);
+                if (m) {
+                    const login = t.includes('password') && t.includes('username');
+                    return login ? {ok:false, why:'loginPage'} : {ok:true, username:m[1]};
+                }
+                return {ok:false, why:'noUsername'};
+            } catch(e) { return {ok:false, why:'err2'}; }
+        } catch(e) { return {ok:false, why:'scriptErr:' + e}; }
     })()"#;
     use tungstenite::Message;
     ws.send(Message::Text(
@@ -342,7 +356,7 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
         .to_string(),
     ))
     .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         if Instant::now() >= deadline {
             return Err(anyhow!("timeout esperando current_user"));
@@ -351,22 +365,33 @@ pub fn current_user_via_page(port: u16) -> Result<Option<String>> {
             Ok(Message::Text(t)) => {
                 let v: serde_json::Value = serde_json::from_str(&t)
                     .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
-                if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
-                    let val = v
-                        .pointer("/result/result/value")
-                        .ok_or_else(|| anyhow!("current_user sin resultado"))?;
-                    let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
-                    let why = val.get("why").and_then(|m| m.as_str()).unwrap_or("?");
-                    if !ok {
-                        return Err(anyhow!(
-                            "sesión del navegador no válida ({why}); vuelve a iniciar sesión en la ventana"
-                        ));
-                    }
-                    return Ok(val
-                        .get("username")
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.to_string()));
+                if v.get("id").and_then(|i| i.as_u64()) != Some(1) {
+                    continue;
                 }
+                // Contexto invalidado (la página navegó durante el fetch):
+                // reconecta y reintenta en vez de fallar.
+                if v.get("error").is_some()
+                    || v.pointer("/result/exceptionDetails").is_some()
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return current_user_via_page(port);
+                }
+                let val = v
+                    .pointer("/result/result/value")
+                    .ok_or_else(|| {
+                        anyhow!("current_user sin resultado: {}", t.chars().take(120).collect::<String>())
+                    })?;
+                let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                let why = val.get("why").and_then(|m| m.as_str()).unwrap_or("?");
+                if !ok {
+                    return Err(anyhow!(
+                        "sesión del navegador no válida ({why}); vuelve a iniciar sesión en la ventana"
+                    ));
+                }
+                return Ok(val
+                    .get("username")
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string()));
             }
             Ok(_) => {}
             Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
