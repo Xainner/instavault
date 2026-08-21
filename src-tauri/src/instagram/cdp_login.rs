@@ -27,7 +27,26 @@ impl Drop for CdpSession {
 }
 
 impl CdpSession {
-    /// Lanza un Chromium headless con perfil propio y CDP en un puerto libre.
+    /// Elimina cualquier proceso de Chrome que use el perfil de InstaVault.
+    /// Sin esto, Chrome redirige al proceso existente (que bloquea el perfil) y el
+    /// nuevo no abre el puerto CDP -> timeout de conexión (os error 10060).
+    pub fn kill_existing() {
+        let Ok(profile) = profile_dir() else { return };
+        let needle = profile.to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe'\" | Where-Object { $_.CommandLine -like '*InstaVault*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+                ])
+                .output();
+        }
+        let _ = needle;
+    }
+
+    /// Lanza un Chromium con perfil propio y CDP en un puerto libre.
     pub fn launch() -> Result<Self> {
         let exe = find_chromium()?;
         let port = free_port()?;

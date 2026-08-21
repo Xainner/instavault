@@ -200,9 +200,14 @@ pub fn close_browser(browser_name: String) -> Result<u32, String> {
 pub fn login_open(state: tauri::State<'_, AppState>) -> Result<(), String> {
     use crate::instagram::cdp_login::CdpSession;
     let mut guard = state.cdp.lock().unwrap();
+    // Limpia cualquier instancia previa (del mismo perfil) que bloquee el
+    // puerto CDP y cause timeout de conexión (os error 10060).
     if guard.is_some() {
-        return Ok(()); // ya hay una ventana abierta
+        let mut s = guard.take().unwrap();
+        s.shutdown();
     }
+    CdpSession::kill_existing();
+    std::thread::sleep(std::time::Duration::from_millis(600));
     *guard = Some(CdpSession::launch().map_err(|e| e.to_string())?);
     let sess = guard.as_mut().unwrap();
     // El puerto debe quedar listo antes de devolver el control a la UI.
