@@ -72,17 +72,27 @@ impl CdpSession {
         Ok(CdpSession { child, port })
     }
 
-    /// Espera a que el CDP esté disponible (hasta 15 s).
-    pub fn wait_ready(&self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                return Ok(());
+    /// Espera a que el CDP HTTP responda de verdad (hasta 25 s).
+        /// Un TCP connect no basta: Chrome abre el socket antes de servir HTTP,
+        /// y consultarlo antes produce timeout de lectura (os error 10060).
+        pub fn wait_ready(&self) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(25);
+            let url = format!("http://127.0.0.1:{}/json/version", self.port);
+            let mut last_err = String::new();
+            while Instant::now() < deadline {
+                match http_get_json(&url) {
+                    Ok(v) if v.get("Browser").is_some() => return Ok(()),
+                    Ok(_) => {
+                        last_err = "CDP respondió sin campo Browser".to_string();
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_millis(300));
-    }
-        Err(anyhow!("el navegador no abrió el puerto de depuración"))
-    }
+            Err(anyhow!("el navegador no abrió el puerto de depuración: {last_err}"))
+        }
 
     /// URL visible para el usuario (no aplica en headless; se usa para debug).
     pub fn debug_url(&self) -> String {
@@ -207,27 +217,66 @@ pub fn http_get_json_for_test(url: &str) -> Result<serde_json::Value> {
 
 /// GET HTTP mínimo que parsea la respuesta JSON.
 fn http_get_json(url: &str) -> Result<serde_json::Value> {
-    let mut url = url.to_string();
-    // httparse manual: evitamos dependencia extra
+    // Parser HTTP mínimo, robusto contra keep-alive: lee los headers y luego
+    // exactamente Content-Length bytes (read_to_end colgaría esperando EOF,
+    // lo que Windows reporta como timeout os error 10060).
+    fn read_line(stream: &mut std::net::TcpStream) -> Result<String> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream.read(&mut byte)?;
+            if n == 0 {
+                break;
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        Ok(String::from_utf8_lossy(&line).trim_end_matches('\r').to_string())
+    }
+
     let host_port_end = url.find("://").map(|i| i + 3).unwrap_or(0);
     let rest = &url[host_port_end..];
     let slash = rest.find('/').ok_or_else(|| anyhow!("URL inválida"))?;
     let host_port = &rest[..slash];
     let path = &rest[slash..];
+
     let mut stream = std::net::TcpStream::connect(host_port)
         .with_context(|| format!("no se pudo conectar a {host_port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n")?;
+    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(8)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+    )?;
     stream.flush()?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .ok_or_else(|| anyhow!("respuesta HTTP malformada"))?;
-    url.clear();
-    serde_json::from_str(body).with_context(|| "JSON inválido en respuesta HTTP")
+
+    // Headers
+    let mut content_length: Option<usize> = None;
+    loop {
+        let line = read_line(&mut stream)?;
+        if line.is_empty() {
+            break; // fin de headers
+        }
+        if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = rest.trim().parse().ok();
+        }
+    }
+    let len = content_length.ok_or_else(|| anyhow!("respuesta sin Content-Length"))?;
+
+    // Cuerpo exacto
+    let mut body = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        let n = stream.read(&mut body[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    body.truncate(read);
+    serde_json::from_slice(&body).with_context(|| "JSON inválido en respuesta HTTP")
 }
 
 /// Busca un ejecutable de Chromium disponible.
