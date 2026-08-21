@@ -1,7 +1,7 @@
 use crate::creds;
 use crate::db::Db;
 use crate::instagram::client::{IgClient, Session};
-use crate::instagram::models::{AccountInfo, MediaRow, ProfileRow, WebProfileUser};
+use crate::instagram::models::{AccountInfo, MediaRow, ProfileRow, WebProfileInfo, WebProfileUser};
 use crate::instagram::{api, download};
 use crate::AppState;
 use std::sync::{Arc, Mutex};
@@ -315,14 +315,25 @@ pub fn login_cancel(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn fetch_profile(
     state: tauri::State<'_, AppState>,
-    account_id: i64,
+    _account_id: i64,
     username: String,
 ) -> Result<ProfileRow, String> {
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
-    let ig = state.ig.clone();
-    let user = api::lookup_profile(&ig, &s, &username)
-        .await
-        .map_err(|e| e.to_string())?;
+    use crate::instagram::cdp_login;
+    // Todas las consultas pasan por el navegador (la API bloquea clientes externos).
+    let port = ensure_api_browser(&state).map_err(|e| e.to_string())?;
+    let path = format!("/api/v1/users/web_profile_info/?username={username}");
+    let json = tokio::task::spawn_blocking(move || {
+        cdp_login::api_fetch_via_page(port, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let info: WebProfileInfo = serde_json::from_value(json)
+        .map_err(|e| format!("respuesta del API inesperada: {e}"))?;
+    let user = info
+        .data
+        .user
+        .ok_or_else(|| "perfil no encontrado (¿el usuario existe?)".to_string())?;
     let row = to_profile_row(&user);
     let id = db(&state)
         .lock()
@@ -333,6 +344,32 @@ pub async fn fetch_profile(
         id: Some(id),
         ..row
     })
+}
+
+/// Asegura que hay un navegador API vivo (con la sesión del perfil de
+/// InstaVault) y devuelve su puerto CDP. Lo lanza si no existe.
+/// Todas las consultas a Instagram pasan por Chrome vía CDP: la API bloquea
+/// (429) los clientes HTTP externos.
+fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
+    use crate::instagram::cdp_login::CdpSession;
+    let mut guard = state.cdp.lock().map_err(|e| e.to_string())?;
+    if let Some(s) = guard.as_mut() {
+        if s.is_alive() {
+            return Ok(s.port());
+        }
+    }
+    // Sin navegador vivo: mata instancias colgadas y lanza uno nuevo
+    // (home, conserva la sesión del login asistido).
+    drop(guard);
+    CdpSession::kill_existing();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let sess = CdpSession::launch_api().map_err(|e| e.to_string())?;
+    sess.wait_ready().map_err(|e| e.to_string())?;
+    let port = sess.port();
+    *state.cdp.lock().map_err(|e| e.to_string())? = Some(sess);
+    // La home necesita unos segundos para cargar y validar la sesión.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    Ok(port)
 }
 
 #[tauri::command]

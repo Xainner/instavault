@@ -46,8 +46,19 @@ impl CdpSession {
         let _ = needle;
     }
 
-    /// Lanza un Chromium con perfil propio y CDP en un puerto libre.
+    /// Lanza el navegador para el login asistido (fuerza logout primero).
     pub fn launch() -> Result<Self> {
+        Self::launch_with_url("https://www.instagram.com/accounts/logout/")
+    }
+
+    /// Lanza el navegador como motor de API (home; conserva la sesión del perfil).
+    /// Instagram bloquea (429) los clientes HTTP externos, así que todas las
+    /// llamadas pasan por el propio Chrome vía CDP.
+    pub fn launch_api() -> Result<Self> {
+        Self::launch_with_url("https://www.instagram.com/")
+    }
+
+    fn launch_with_url(start_url: &str) -> Result<Self> {
         let exe = find_chromium()?;
         let port = free_port()?;
         let profile_dir = profile_dir()?;
@@ -56,16 +67,10 @@ impl CdpSession {
         let child = Command::new(&exe)
             .args([
                 &format!("--remote-debugging-port={port}"),
-                &format!(
-                    "--user-data-dir={}",
-                    profile_dir.display()
-                ),
+                &format!("--user-data-dir={}", profile_dir.display()),
                 "--no-first-run",
                 "--no-default-browser-check",
-                // Logout primero: limpia sesiones viejas del perfil (que
-                // quedan con otro UA y la API las rechaza con
-                // "useragent mismatch"). Redirige a login automáticamente.
-                "https://www.instagram.com/accounts/logout/",
+                start_url,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -286,6 +291,81 @@ pub fn raw_fetch_for_test(port: u16) -> Result<String> {
                         .unwrap_or("?")
                         .to_string());
                 }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
+}
+
+/// Ejecuta un GET relativo del API (p. ej. `/api/v1/users/web_profile_info/?username=x`)
+/// DESDE la página de Instagram y devuelve el JSON parseado.
+/// Es el motor de todas las consultas: Instagram bloquea (429) los clientes
+/// HTTP externos, pero responde bien a los fetch del propio navegador.
+pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    let expr = format!(
+        r#"(async () => {{
+            try {{
+                const res = await fetch({path:?}, {{
+                    headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
+                    credentials: 'include'
+                }});
+                const t = await res.text();
+                if (res.status === 429) return {{ok:false, why:'rateLimit'}};
+                if (res.status === 403) return {{ok:false, why:'forbidden'}};
+                if (res.status === 404) return {{ok:false, why:'notFound'}};
+                if (res.status >= 400) return {{ok:false, why:'http'+res.status}};
+                try {{ const j = JSON.parse(t); return {{ok:true, v:j}}; }}
+                catch(e) {{ return {{ok:false, why:'html'}}; }}
+            }} catch(e) {{ return {{ok:false, why:'netErr'}}; }}
+        }})()"#
+    );
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expr, "returnByValue": true, "awaitPromise": true}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout esperando respuesta del API"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) != Some(1) {
+                    continue;
+                }
+                if v.get("error").is_some() || v.pointer("/result/exceptionDetails").is_some() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return api_fetch_via_page(port, path);
+                }
+                let val = v
+                    .pointer("/result/result/value")
+                    .ok_or_else(|| anyhow!("API sin resultado"))?;
+                let ok = val.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                let why = val.get("why").and_then(|m| m.as_str()).unwrap_or("?");
+                if !ok {
+                    let label = match why {
+                        "rateLimit" => "Instagram limitó la petición (429); espera un momento e inténtalo de nuevo".to_string(),
+                        "forbidden" => "Instagram rechazó la petición (403)".to_string(),
+                        "notFound" => "perfil no encontrado (¿el usuario existe?)".to_string(),
+                        "html" => "Instagram devolvió HTML en vez de JSON (¿sesión expirada?)".to_string(),
+                        "netErr" => "error de red del navegador".to_string(),
+                        other => format!("Instagram respondió: {other}"),
+                    };
+                    return Err(anyhow!(label));
+                }
+                return Ok(val.get("v").cloned().unwrap_or(serde_json::Value::Null));
             }
             Ok(_) => {}
             Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
