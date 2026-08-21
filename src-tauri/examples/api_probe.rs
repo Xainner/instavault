@@ -1,12 +1,13 @@
-//! Prueba e2e del motor API CDP: busca perfiles públicos con la sesión guardada.
-//! Ejecutar: cargo run --example api_probe
+//! Simula el caso real: navegador del login asistido (página login/logout)
+//! reutilizado como motor API. Navega a la home y busca.
 use instavault_lib::instagram::cdp_login::{self, CdpSession};
 use std::time::Duration;
 
 fn main() {
+    // Estado REAL tras el login asistido: navegador vivo pero en logout/login.
     CdpSession::kill_existing();
     std::thread::sleep(Duration::from_millis(600));
-    let mut sess = match CdpSession::launch_api() {
+    let mut sess = match CdpSession::launch() {
         Ok(s) => s,
         Err(e) => {
             println!("LAUNCH FALLO: {e:#}");
@@ -17,9 +18,15 @@ fn main() {
         println!("WAIT FALLO: {e:#}");
         return;
     }
-    std::thread::sleep(Duration::from_secs(5)); // home cargando
+    // Deja que cargue la página de logout/login (estado "sucio").
+    std::thread::sleep(Duration::from_secs(4));
 
-    for username in ["cristiano", "fiochavesch", "leomessi"] {
+    // Ahora el flujo de búsqueda real: navegar a home y buscar.
+    match cdp_login::navigate_home(sess.port()) {
+        Ok(()) => println!("navegación a home OK"),
+        Err(e) => println!("navegación FALLO: {e:#}"),
+    }
+    for username in ["cristiano", "fiochavesch"] {
         let path = format!("/api/v1/users/web_profile_info/?username={username}");
         match cdp_login::api_fetch_via_page(sess.port(), &path) {
             Ok(v) => {
@@ -27,11 +34,7 @@ fn main() {
                     .pointer("/data/user/username")
                     .and_then(|u| u.as_str())
                     .unwrap_or("?");
-                let privado = v
-                    .pointer("/data/user/is_private")
-                    .and_then(|u| u.as_bool())
-                    .unwrap_or(false);
-                println!("OK {username}: @{name} privado={privado}");
+                println!("OK {username}: @{name}");
             }
             Err(e) => println!("FALLO {username}: {e:#}"),
         }

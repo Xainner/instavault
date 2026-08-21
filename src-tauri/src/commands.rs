@@ -351,11 +351,16 @@ pub async fn fetch_profile(
 /// Todas las consultas a Instagram pasan por Chrome vía CDP: la API bloquea
 /// (429) los clientes HTTP externos.
 fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
-    use crate::instagram::cdp_login::CdpSession;
+    use crate::instagram::cdp_login::{self, CdpSession};
     let mut guard = state.cdp.lock().map_err(|e| e.to_string())?;
     if let Some(s) = guard.as_mut() {
         if s.is_alive() {
-            return Ok(s.port());
+            let port = s.port();
+            drop(guard);
+            // El navegador reutilizado puede estar en login/logout/2FA:
+            // navega a la home para que la sesión del perfil se active.
+            let _ = cdp_login::navigate_home(port);
+            return Ok(port);
         }
     }
     // Sin navegador vivo: mata instancias colgadas y lanza uno nuevo
@@ -368,7 +373,7 @@ fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
     let port = sess.port();
     *state.cdp.lock().map_err(|e| e.to_string())? = Some(sess);
     // La home necesita unos segundos para cargar y validar la sesión.
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    std::thread::sleep(std::time::Duration::from_secs(6));
     Ok(port)
 }
 

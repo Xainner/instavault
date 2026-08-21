@@ -415,6 +415,45 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
     }
 }
 
+/// Navega la página actual a la home de Instagram y espera a que cargue.
+/// Necesario antes de usar el motor API: el navegador reutilizado puede
+/// estar en login/logout/2FA, donde los fetch redirigen a login.
+pub fn navigate_home(port: u16) -> Result<()> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Page.navigate",
+            "params": {"url": "https://www.instagram.com/"}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error navegando: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout navegando a la home"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
+    // Deja que la home cargue y valide la sesión.
+    std::thread::sleep(Duration::from_secs(6));
+    Ok(())
+}
+
 /// GET HTTP mínimo que parsea la respuesta JSON (expuesto para diagnóstico).
 #[doc(hidden)]
 pub fn http_get_json_for_test(url: &str) -> Result<serde_json::Value> {
