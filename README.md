@@ -5,8 +5,8 @@
 <h1 align="center">InstaVault</h1>
 
 <p align="center">
-  <strong>Archivador local de perfiles de Instagram.</strong><br/>
-  Publicaciones, stories, highlights y fotos de perfil — descargados en máxima calidad<br/>y organizados en una biblioteca SQLite con deduplicación.
+  <strong>Archivador privado de perfiles de Instagram.</strong><br/>
+  Publicaciones, stories, highlights y fotos de perfil en máxima calidad,<br/>guardados como BLOB dentro de una biblioteca SQLite local.
 </p>
 
 <p align="center">
@@ -44,11 +44,12 @@
 - **Download manager**: concurrencia configurable, progreso por ítem, reintentos con backoff y panel de jobs.
 - **Deduplicación por `media_id`**: nunca re-baja lo que ya está en disco.
 - **Re-descargar** cualquier ítem (borra el archivo y lo baja de nuevo) y **vaciar el álbum** por perfil.
-- **Álbum por perfil**: grilla de lo descargado con lightbox, y **“Guardar en este equipo”** para copiar cualquier archivo (o la foto de perfil) a donde quieras.
+- **Álbum por perfil**: grilla de lo descargado con lightbox. Los bytes permanecen dentro de SQLite y **“Guardar en dispositivo”** exporta una copia al destino que elijas.
+- **Actualizaciones automáticas firmadas** desde GitHub Releases, con comprobación al iniciar y desde “Acerca de”.
 
 ### Biblioteca local
 - SQLite (modo WAL): perfiles, medios, highlights, jobs y estado de cada descarga, con reintentos de fallidos.
-- Interfaz en español, tema oscuro, animaciones con Framer Motion.
+- Interfaz en español con Tailwind CSS 4, shadcn/ui, Motion, Lucide, Sonner y tema oscuro accesible.
 
 ---
 
@@ -70,7 +71,7 @@ npm install
 # Desarrollo (hot-reload)
 npm run tauri dev
 
-# Build de producción (instalador MSI + NSIS en Windows)
+# Build de producción (instalador NSIS en Windows x64)
 npm run tauri build
 ```
 
@@ -79,8 +80,8 @@ npm run tauri build
 ### Primeros pasos
 1. **Cuentas** → agregá tu sesión (pegando cookies o importando desde tu navegador; también hay login asistido con el navegador de la app).
 2. **Perfiles** → buscá un username. El primer sync es automático; desde el detalle podés sincronizar por tipo (posts / stories / highlights).
-3. **Descargar pendientes** → los archivos van a `%APPDATA%/com.xainner.instavault/downloads/<username>/<tipo>/` (en macOS/Linux: `~/Library/Application Support/…` / `~/.local/share/…`).
-4. **Álbum** → mirá lo descargado, copialo a tu equipo o re-descargalo en máxima calidad.
+3. **Descargar pendientes** → fotos, videos y avatares se guardan dentro de `%APPDATA%/com.xainner.instavault/instakeeper.db`.
+4. **Álbum** → mira lo descargado, expórtalo con “Guardar en dispositivo” o vuelve a descargarlo en máxima calidad.
 
 ---
 
@@ -119,7 +120,7 @@ src/
 - **CDP (Chrome DevTools Protocol)**: la app levanta un Chrome headless con perfil propio. Instagram bloquea (429) a los clientes HTTP externos para varias rutas, así que búsqueda de perfiles, validación de sesión y highlights pasan por el navegador: `Page.navigate` + `Runtime.evaluate` con timeouts estrictos.
 - **Calidad de imagen**: los candidatos mobile traen `stp=…e35…` (re-encode CDN) y, para stories, límite de píxeles. La firma `oh/oe` cubre el query completo (no se puede editar el `stp`), por eso la calidad máxima se obtiene consultando `media/{id}/info/` en cada descarga: devuelve candidatos frescos y, para stories/highlights, el tamaño original.
 - **Avatares**: el CDN de fotos de perfil tiene issues DNS (AAAA blackhole) en algunos entornos; la descarga de avatar fuerza IPv4 y el resultado se sirve vía asset protocol de Tauri.
-- **Datos**: `%APPDATA%/com.xainner.instavault/` → `instakeeper.db` (WAL), `downloads/`, `avatars/`.
+- **Datos**: `%APPDATA%/com.xainner.instavault/instakeeper.db` (SQLite WAL). No se crean archivos de medios independientes salvo al exportarlos.
 
 ---
 

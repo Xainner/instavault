@@ -355,20 +355,36 @@ pub async fn fetch_profile(
     })
 }
 
+/// Prepara Chrome/CDP en segundo plano para que la primera búsqueda no pague
+/// el coste de arranque. No consulta ningún perfil.
+#[tauri::command]
+pub async fn warm_search_engine(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let cdp = state.cdp.clone();
+    tokio::task::spawn_blocking(move || {
+        let wrapper = AppStateRef { cdp };
+        ensure_api_browser_cdp(&wrapper.cdp).map(|_| ())
+    }).await.map_err(|e| e.to_string())?
+}
+
+struct AppStateRef {
+    cdp: std::sync::Arc<std::sync::Mutex<Option<crate::instagram::cdp_login::CdpSession>>>,
+}
+
 /// Asegura que hay un navegador API vivo (con la sesión del perfil de
 /// InstaVault) y devuelve su puerto CDP. Lo lanza si no existe.
 /// Todas las consultas a Instagram pasan por Chrome vía CDP: la API bloquea
 /// (429) los clientes HTTP externos.
 fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
-    use crate::instagram::cdp_login::{self, CdpSession};
-    let mut guard = state.cdp.lock().map_err(|e| e.to_string())?;
+    ensure_api_browser_cdp(&state.cdp)
+}
+
+fn ensure_api_browser_cdp(cdp: &std::sync::Arc<std::sync::Mutex<Option<crate::instagram::cdp_login::CdpSession>>>) -> Result<u16, String> {
+    use crate::instagram::cdp_login::CdpSession;
+    let mut guard = cdp.lock().map_err(|e| e.to_string())?;
     if let Some(s) = guard.as_mut() {
         if s.is_alive() {
             let port = s.port();
             drop(guard);
-            // El navegador reutilizado puede estar en login/logout/2FA:
-            // navega a la home para que la sesión del perfil se active.
-            let _ = cdp_login::navigate_home(port);
             return Ok(port);
         }
     }
@@ -380,9 +396,7 @@ fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
     let sess = CdpSession::launch_api().map_err(|e| e.to_string())?;
     sess.wait_ready().map_err(|e| e.to_string())?;
     let port = sess.port();
-    *state.cdp.lock().map_err(|e| e.to_string())? = Some(sess);
-    // La home necesita unos segundos para cargar y validar la sesión.
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    *cdp.lock().map_err(|e| e.to_string())? = Some(sess);
     Ok(port)
 }
 
@@ -410,7 +424,7 @@ pub fn delete_profile(state: tauri::State<'_, AppState>, profile_id: i64) -> Res
 #[tauri::command]
 pub fn reset_download(state: tauri::State<'_, AppState>, media_pk: i64) -> Result<(), String> {
     let dbl = db(&state);
-    let path = {
+    {
         let lock = dbl.lock().unwrap();
         let row = lock
             .get_media_by_id(media_pk)
@@ -420,10 +434,6 @@ pub fn reset_download(state: tauri::State<'_, AppState>, media_pk: i64) -> Resul
             return Err("el medio no está descargado".to_string());
         }
         lock.reset_download(media_pk).map_err(|e| e.to_string())?;
-        row.local_path
-    };
-    if let Some(p) = path {
-        let _ = std::fs::remove_file(p);
     }
     Ok(())
 }
@@ -437,18 +447,6 @@ pub fn clear_downloads(
     kind: Option<String>,
 ) -> Result<usize, String> {
     let dbl = db(&state);
-    let paths: Vec<String> = {
-        let lock = dbl.lock().unwrap();
-        lock.media_by_profile(profile_id, kind.as_deref())
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|m| m.status == "downloaded")
-            .filter_map(|m| m.local_path)
-            .collect()
-    };
-    for p in &paths {
-        let _ = std::fs::remove_file(p);
-    }
     let n = dbl
         .lock()
         .unwrap()
@@ -846,17 +844,10 @@ pub async fn download_avatar(
             .ok_or_else(|| "perfil no encontrado".to_string())?;
         (p.profile_pic_url.clone(), p.avatar_local_path.clone())
     };
-    if let Some(p) = cached.filter(|p| std::path::Path::new(p).is_file()) {
+    if let Some(p) = cached.filter(|p| p.contains("vault.localhost") || std::path::Path::new(p).is_file()) {
         return Ok(Some(p));
     }
     let url = url.ok_or_else(|| "el perfil no tiene URL de foto".to_string())?;
-    let dir = state
-        .data_dir
-        .parent()
-        .map(|d| d.join("avatars"))
-        .unwrap_or_else(|| state.data_dir.join("avatars"));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("{}.jpg", profile_id));
     // Fuerza IPv4 si hay registro A: el AAAA de la CDN está blackholeado y
     // esperar el timeout de SYN de IPv6 tardaría ~20 s por intento.
     let host = url::Url::parse(&url)
@@ -873,7 +864,7 @@ pub async fn download_avatar(
         builder = builder.resolve(h, addr);
     }
     let client = builder.build().map_err(|e| e.to_string())?;
-    let bytes = client
+    let resp = client
         .get(&url)
         .header(
             "User-Agent",
@@ -883,20 +874,22 @@ pub async fn download_avatar(
         .await
         .map_err(|e| format!("no se pudo descargar la foto: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("la CDN rechazó la foto: {e}"))?
+        .map_err(|e| format!("la CDN rechazó la foto: {e}"))?;
+    let mime = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg")
+        .split(';').next().unwrap_or("image/jpeg").to_string();
+    let bytes = resp
         .bytes()
         .await
         .map_err(|e| e.to_string())?;
     if bytes.len() < 100 {
         return Err("la respuesta de la foto no parece una imagen".to_string());
     }
-    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
-    let path = file.to_string_lossy().to_string();
     dbl.lock()
         .unwrap()
-        .set_avatar_path(profile_id, &path)
+        .store_avatar_content(profile_id, &bytes, &mime)
         .map_err(|e| e.to_string())?;
-    Ok(Some(path))
+    Ok(Some(format!("http://vault.localhost/avatar/{profile_id}")))
 }
 
 #[tauri::command]
@@ -935,28 +928,26 @@ pub fn clear_finished_jobs(state: tauri::State<'_, AppState>) -> Result<(), Stri
 /// ("Guardar en este equipo"). `dest` puede ser solo la carpeta (se usa el
 /// nombre original del archivo) o un path completo.
 #[tauri::command]
-pub fn copy_file_to(source: String, dest: String) -> Result<String, String> {
-    let src = std::path::Path::new(&source);
-    if !src.is_file() {
-        return Err(format!("el archivo no existe: {source}"));
-    }
+pub fn export_media(state: tauri::State<'_, AppState>, media_pk: i64, dest: String) -> Result<String, String> {
+    let content = db(&state).lock().unwrap().media_content(media_pk)
+        .map_err(|e| e.to_string())?.ok_or_else(|| "el medio no está guardado".to_string())?;
+    write_export(&content.data, &dest)
+}
+
+#[tauri::command]
+pub fn export_avatar(state: tauri::State<'_, AppState>, profile_id: i64, dest: String) -> Result<String, String> {
+    let content = db(&state).lock().unwrap().avatar_content(profile_id)
+        .map_err(|e| e.to_string())?.ok_or_else(|| "el avatar no está guardado".to_string())?;
+    write_export(&content.data, &dest)
+}
+
+fn write_export(data: &[u8], dest: &str) -> Result<String, String> {
     let dest_path = std::path::Path::new(&dest);
-    // Si dest termina en un separador o es una carpeta existente, metemos el
-    // nombre original del archivo dentro.
-    let target = if dest_path.is_dir() {
-        let name = src
-            .file_name()
-            .map(|n| n.to_os_string())
-            .ok_or_else(|| "sin nombre de archivo".to_string())?;
-        dest_path.join(name)
-    } else {
-        dest_path.to_path_buf()
-    };
-    if let Some(parent) = target.parent() {
+    if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::copy(src, &target).map_err(|e| e.to_string())?;
-    Ok(target.to_string_lossy().to_string())
+    std::fs::write(dest_path, data).map_err(|e| e.to_string())?;
+    Ok(dest_path.to_string_lossy().to_string())
 }
 
 // ---------------------------------------------------------------------------

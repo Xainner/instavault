@@ -153,6 +153,8 @@ pub struct VideoVersion {
     pub type_: Option<i64>,
     pub url: String,
     #[serde(default)]
+    pub bit_rate: Option<i64>,
+    #[serde(default)]
     pub width: i64,
     #[serde(default)]
     pub height: i64,

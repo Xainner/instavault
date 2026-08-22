@@ -1,9 +1,9 @@
-import { motion } from "framer-motion";
-import { Download, KeyRound, LayoutGrid, ShieldCheck } from "lucide-react";
+import { motion } from "motion/react";
+import { Download, Info, KeyRound, LayoutGrid, ShieldCheck } from "lucide-react";
 import type { AccountInfo } from "../types";
 import { useDownloads } from "./Downloads";
 
-export type View = "profiles" | "accounts";
+export type View = "profiles" | "accounts" | "about";
 
 export function Sidebar({
   view,
@@ -32,6 +32,7 @@ export function Sidebar({
   const items: { id: View; label: string; icon: React.ReactNode; badge: number }[] = [
     { id: "profiles", label: "Perfiles", icon: <LayoutGrid size={18} />, badge: profileCount },
     { id: "accounts", label: "Cuentas", icon: <KeyRound size={18} />, badge: accounts.length },
+    { id: "about", label: "Acerca de", icon: <Info size={18} />, badge: 0 },
   ];
 
   return (
@@ -59,7 +60,7 @@ export function Sidebar({
             )}
             <span className="nav-icon">{it.icon}</span>
             {it.label}
-            <span className="nav-badge">{it.badge}</span>
+            {it.badge > 0 && <span className="nav-badge">{it.badge}</span>}
           </button>
         ))}
 
@@ -111,7 +112,7 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="side-foot">v0.1.0 · {mediaCount} archivos</div>
+      <div className="side-foot">v1.0.0 · {mediaCount} archivos · <kbd>Ctrl K</kbd></div>
     </aside>
   );
 }

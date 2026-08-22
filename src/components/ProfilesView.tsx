@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -65,7 +65,7 @@ export function ProfileAvatar({
   const [err, setErr] = useState(false);
   // La copia local (descargada en Rust, servida por asset-protocol) siempre
   // gana: la URL remota de la CDN expira y su IPv6 puede estar caído.
-  const src = localPath ? convertFileSrc(localPath) : url;
+  const src = localPath ? (localPath.includes("vault.localhost") ? localPath : convertFileSrc(localPath)) : url;
   // Una URL nueva (re-fetch) puede ser válida aunque la anterior fallara.
   useEffect(() => setErr(false), [src]);
   return (
@@ -368,6 +368,8 @@ export function ProfilesView({
   const { toast } = useToast();
   const [query, setQuery] = useState("");
   const [saving, setSaving] = useState(false);
+  const [searchPhase, setSearchPhase] = useState("");
+  const [elapsed, setElapsed] = useState(0);
   const [onlyFav, setOnlyFav] = useState(false);
 
   const doSearch = async (username: string) => {
@@ -377,8 +379,17 @@ export function ProfilesView({
       return;
     }
     setSaving(true);
+    setSearchPhase("Preparando sesión");
+    setElapsed(0);
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      setElapsed(seconds);
+      if (seconds >= 1) setSearchPhase("Consultando Instagram");
+    }, 250);
     try {
       const p = await fetchProfile(accountId, u);
+      setSearchPhase("Guardando perfil");
       if (p.is_private === 1)
         toast("info", `@${p.username} es privado`, "Sincroniza desde la tarjeta para acceder.");
       toast("success", `@${p.username} en tu biblioteca`);
@@ -387,7 +398,9 @@ export function ProfilesView({
     } catch (e) {
       toast("error", "No se encontró", String(e));
     } finally {
+      window.clearInterval(timer);
       setSaving(false);
+      setSearchPhase("");
     }
   };
 
@@ -450,6 +463,14 @@ export function ProfilesView({
           Favoritos
         </button>
       </div>
+
+      {saving && (
+        <div className="search-progress" role="status" aria-live="polite">
+          <Loader2 size={14} className="spin" />
+          <span>{searchPhase}</span>
+          <small>{elapsed}s</small>
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} className="empty">

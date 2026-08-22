@@ -1,5 +1,17 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct ContentRecord {
+    pub data: Vec<u8>,
+    pub mime_type: String,
+    pub byte_size: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub quality_verified: bool,
+}
 
 pub struct Db {
     conn: Connection,
@@ -13,6 +25,7 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = Db { conn };
         db.migrate()?;
+        db.migrate_legacy_files()?;
         Ok(db)
     }
 
@@ -86,6 +99,29 @@ impl Db {
                 started_at  INTEGER NOT NULL,
                 finished_at INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS media_content (
+                media_id         INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+                data             BLOB NOT NULL,
+                mime_type        TEXT NOT NULL,
+                byte_size        INTEGER NOT NULL,
+                sha256           TEXT NOT NULL,
+                width            INTEGER,
+                height           INTEGER,
+                bitrate          INTEGER,
+                quality_verified INTEGER NOT NULL DEFAULT 0,
+                source           TEXT NOT NULL DEFAULT 'legacy',
+                downloaded_at    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS profile_avatar_content (
+                profile_id    INTEGER PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+                data          BLOB NOT NULL,
+                mime_type     TEXT NOT NULL,
+                byte_size     INTEGER NOT NULL,
+                sha256        TEXT NOT NULL,
+                downloaded_at INTEGER NOT NULL
+            );
             "#,
         )?;
         // Migration para BDs existentes (idempotente): la columna is_favorite
@@ -107,6 +143,50 @@ impl Db {
             "UPDATE download_jobs SET finished_at=?1 WHERE finished_at IS NULL",
             [chrono::Utc::now().timestamp()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_legacy_files(&self) -> rusqlite::Result<()> {
+        let media: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, local_path FROM media WHERE local_path IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM media_content WHERE media_id=media.id)",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (id, path) in media {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if !bytes.is_empty() {
+                    let mime = mime_from_path(&path, false);
+                    self.store_media_content(id, &bytes, &mime, None, None, None, false, "legacy")?;
+                    if self.media_content(id)?.map(|c| c.byte_size as usize) == Some(bytes.len()) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        let avatars: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, avatar_local_path FROM profiles WHERE avatar_local_path IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM profile_avatar_content WHERE profile_id=profiles.id)",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (id, path) in avatars {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if !bytes.is_empty() {
+                    let mime = mime_from_path(&path, false);
+                    self.store_avatar_content(id, &bytes, &mime)?;
+                    if self.avatar_content(id)?.map(|c| c.byte_size as usize) == Some(bytes.len()) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -224,7 +304,9 @@ impl Db {
     ) -> rusqlite::Result<Option<crate::instagram::models::ProfileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT username, pk, full_name, biography, followers, following, media_count,
-                    is_private, is_verified, profile_pic_url, avatar_local_path,
+                    is_private, is_verified, profile_pic_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM profile_avatar_content a WHERE a.profile_id=profiles.id)
+                         THEN 'http://vault.localhost/avatar/' || profiles.id ELSE avatar_local_path END,
                     is_favorite, fetched_at, id
              FROM profiles WHERE id=?1",
         )?;
@@ -253,7 +335,9 @@ impl Db {
     pub fn list_profiles(&self) -> rusqlite::Result<Vec<crate::instagram::models::ProfileRow>> {
         let mut stmt = self.conn.prepare(
 "SELECT username, pk, full_name, biography, followers, following, media_count,
-                    is_private, is_verified, profile_pic_url, avatar_local_path,
+                    is_private, is_verified, profile_pic_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM profile_avatar_content a WHERE a.profile_id=profiles.id)
+                         THEN 'http://vault.localhost/avatar/' || profiles.id ELSE avatar_local_path END,
                     is_favorite, fetched_at, id
              FROM profiles ORDER BY is_favorite DESC, username",
         )?;
@@ -313,12 +397,58 @@ impl Db {
         )?)
     }
 
-    pub fn mark_downloaded(&self, id: i64, local_path: &str) -> rusqlite::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_media_content(
+        &self, id: i64, data: &[u8], mime_type: &str, width: Option<i64>,
+        height: Option<i64>, bitrate: Option<i64>, quality_verified: bool, source: &str,
+    ) -> rusqlite::Result<()> {
+        let sha = sha256_hex(data);
         self.conn.execute(
-            "UPDATE media SET status='downloaded', local_path=?2, error=NULL WHERE id=?1",
-            params![id, local_path],
+            "INSERT INTO media_content
+             (media_id,data,mime_type,byte_size,sha256,width,height,bitrate,quality_verified,source,downloaded_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(media_id) DO UPDATE SET data=excluded.data,mime_type=excluded.mime_type,
+             byte_size=excluded.byte_size,sha256=excluded.sha256,width=excluded.width,
+             height=excluded.height,bitrate=excluded.bitrate,quality_verified=excluded.quality_verified,
+             source=excluded.source,downloaded_at=excluded.downloaded_at",
+            params![id, data, mime_type, data.len() as i64, sha, width, height, bitrate,
+                    quality_verified as i64, source, chrono::Utc::now().timestamp()],
+        )?;
+        self.conn.execute(
+            "UPDATE media SET status='downloaded', local_path=NULL, error=NULL WHERE id=?1", [id],
         )?;
         Ok(())
+    }
+
+    pub fn media_content(&self, id: i64) -> rusqlite::Result<Option<ContentRecord>> {
+        self.conn.query_row(
+            "SELECT data,mime_type,byte_size,width,height,bitrate,quality_verified
+             FROM media_content WHERE media_id=?1", [id], |r| Ok(ContentRecord {
+                data: r.get(0)?, mime_type: r.get(1)?, byte_size: r.get(2)?,
+                width: r.get(3)?, height: r.get(4)?, bitrate: r.get(5)?,
+                quality_verified: r.get::<_, i64>(6)? != 0,
+            }),
+        ).optional()
+    }
+
+    pub fn store_avatar_content(&self, profile_id: i64, data: &[u8], mime_type: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO profile_avatar_content (profile_id,data,mime_type,byte_size,sha256,downloaded_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(profile_id) DO UPDATE SET data=excluded.data,mime_type=excluded.mime_type,
+             byte_size=excluded.byte_size,sha256=excluded.sha256,downloaded_at=excluded.downloaded_at",
+            params![profile_id, data, mime_type, data.len() as i64, sha256_hex(data), chrono::Utc::now().timestamp()],
+        )?;
+        self.conn.execute("UPDATE profiles SET avatar_local_path=NULL WHERE id=?1", [profile_id])?;
+        Ok(())
+    }
+
+    pub fn avatar_content(&self, profile_id: i64) -> rusqlite::Result<Option<ContentRecord>> {
+        self.conn.query_row(
+            "SELECT data,mime_type,byte_size,NULL,NULL,NULL,1 FROM profile_avatar_content WHERE profile_id=?1",
+            [profile_id], |r| Ok(ContentRecord { data:r.get(0)?, mime_type:r.get(1)?, byte_size:r.get(2)?,
+                width:None, height:None, bitrate:None, quality_verified:true }),
+        ).optional()
     }
 
     pub fn mark_failed(&self, id: i64, error: &str) -> rusqlite::Result<()> {
@@ -331,6 +461,7 @@ impl Db {
 
     /// Vuelve un medio descargado a pendiente (permite re-descargarlo).
     pub fn reset_download(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM media_content WHERE media_id=?1", [id])?;
         self.conn.execute(
             "UPDATE media SET status='metadata', local_path=NULL, error=NULL WHERE id=?1",
             params![id],
@@ -346,11 +477,17 @@ impl Db {
     ) -> rusqlite::Result<usize> {
         let n = if let Some(k) = kind {
             self.conn.execute(
+                "DELETE FROM media_content WHERE media_id IN
+                 (SELECT id FROM media WHERE profile_id=?1 AND kind=?2)", params![profile_id, k])?;
+            self.conn.execute(
                 "UPDATE media SET status='metadata', local_path=NULL, error=NULL
                  WHERE profile_id=?1 AND kind=?2 AND status='downloaded'",
                 params![profile_id, k],
             )?
         } else {
+            self.conn.execute(
+                "DELETE FROM media_content WHERE media_id IN
+                 (SELECT id FROM media WHERE profile_id=?1)", [profile_id])?;
             self.conn.execute(
                 "UPDATE media SET status='metadata', local_path=NULL, error=NULL
                  WHERE profile_id=?1 AND status='downloaded'",
@@ -367,7 +504,10 @@ impl Db {
     ) -> rusqlite::Result<Vec<crate::instagram::models::MediaRow>> {
         let mut sql = String::from(
             "SELECT media_id, profile_id, kind, code, taken_at, caption, media_type,
-                    thumbnail_url, best_url, local_path, status, error, created_at, id
+                    thumbnail_url, best_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
+                         THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
+                    status, error, created_at, id
              FROM media WHERE profile_id=?1",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(profile_id)];
@@ -409,7 +549,10 @@ impl Db {
     ) -> rusqlite::Result<Vec<crate::instagram::models::MediaRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT media_id, profile_id, kind, code, taken_at, caption, media_type,
-                    thumbnail_url, best_url, local_path, status, error, created_at, id
+                    thumbnail_url, best_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
+                         THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
+                    status, error, created_at, id
              FROM media WHERE status='metadata' AND best_url IS NOT NULL LIMIT ?1",
         )?;
         let rows = stmt
@@ -606,7 +749,10 @@ let mut out = Vec::with_capacity(by_profile.len());
     ) -> rusqlite::Result<Option<crate::instagram::models::MediaRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT media_id, profile_id, kind, code, taken_at, caption, media_type,
-                    thumbnail_url, best_url, local_path, status, error, created_at, id
+                    thumbnail_url, best_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
+                         THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
+                    status, error, created_at, id
              FROM media WHERE id=?1",
         )?;
         let mut rows = stmt.query_map(params![id], |r| {
@@ -692,6 +838,22 @@ let mut out = Vec::with_capacity(by_profile.len());
     }
 }
 
+fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+fn mime_from_path(path: &str, video: bool) -> String {
+    if video || path.to_ascii_lowercase().ends_with(".mp4") {
+        "video/mp4".to_string()
+    } else if path.to_ascii_lowercase().ends_with(".png") {
+        "image/png".to_string()
+    } else if path.to_ascii_lowercase().ends_with(".webp") {
+        "image/webp".to_string()
+    } else {
+        "image/jpeg".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,11 +917,12 @@ mod tests {
             id: None,
         };
         let mid = db.upsert_media(&m).unwrap();
-        db.mark_downloaded(mid, "/ruta/a.jpg").unwrap();
+        db.store_media_content(mid, b"image-bytes", "image/jpeg", Some(1080), Some(1350), None, true, "test").unwrap();
         let med = db.media_by_profile(pid, Some("post")).unwrap();
         assert_eq!(med.len(), 1);
         assert_eq!(med[0].status, "downloaded");
-        assert_eq!(med[0].local_path.as_deref(), Some("/ruta/a.jpg"));
+        let expected = format!("http://vault.localhost/media/{mid}");
+        assert_eq!(med[0].local_path.as_deref(), Some(expected.as_str()));
 
         // cascada: al borrar el perfil se borra el media
         db.delete_profile_cascade(pid).unwrap();
@@ -893,7 +1056,7 @@ mod tests {
         let b = db.upsert_media(&mk("b")).unwrap();
         let c = db.upsert_media(&mk("c")).unwrap();
         db.mark_failed(a, "HTTP 404").unwrap();
-        db.mark_downloaded(b, "/tmp/b.jpg").unwrap();
+        db.store_media_content(b, b"b", "image/jpeg", None, None, None, false, "test").unwrap();
         // c queda metadata.
         let n = db.reset_failed(pid, "post").unwrap();
         assert_eq!(n, 1);
@@ -927,7 +1090,7 @@ mod tests {
         };
         let a = db.upsert_media(&mk("a")).unwrap();
         let _ = db.upsert_media(&mk("b")).unwrap();
-        db.mark_downloaded(a, "/tmp/a.jpg").unwrap();
+        db.store_media_content(a, b"a", "image/jpeg", None, None, None, false, "test").unwrap();
         db.record_sync(pid, "post").unwrap();
         db.record_sync(pid, "story").unwrap(); // sin media: aparece solo por la sync
         let stats = db.profile_stats().unwrap();
@@ -964,5 +1127,28 @@ mod tests {
         // cascade: borrar el perfil borra los jobs
         db.delete_profile_cascade(pid).unwrap();
         assert_eq!(db.list_jobs(10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_file_is_verified_then_migrated_to_blob() {
+        let dir = std::env::temp_dir().join(format!("instakeeper_migrate_{}", uuid::Uuid::new_v4()));
+        let legacy = dir.join("legacy.jpg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&legacy, b"legacy-image-bytes").unwrap();
+        let db = Db::open(&dir).unwrap();
+        let pid = db.upsert_profile(&mk_profile("migration", None)).unwrap();
+        let mid = db.upsert_media(&MediaRow {
+            media_id: "legacy-media".into(), profile_id: Some(pid), kind: "post".into(),
+            code: None, taken_at: None, caption: None, media_type: Some(1),
+            thumbnail_url: None, best_url: Some("https://example.invalid/a.jpg".into()),
+            local_path: Some(legacy.to_string_lossy().to_string()), status: "downloaded".into(),
+            error: None, created_at: None, id: None,
+        }).unwrap();
+        drop(db);
+        let reopened = Db::open(&dir).unwrap();
+        let stored = reopened.media_content(mid).unwrap().unwrap();
+        assert_eq!(stored.data, b"legacy-image-bytes");
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

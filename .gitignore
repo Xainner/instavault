@@ -11,6 +11,21 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+downloads/
+avatars/
+*.key
+*.pem
+*.pfx
+*.p12
+*.sig
 
 # Editor directories and files
 .vscode/*

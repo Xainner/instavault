@@ -6,7 +6,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import {
   AlertTriangle,
   CheckCircle2,

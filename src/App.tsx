@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { Sidebar, type View } from "./components/Sidebar";
 import { AccountsView } from "./components/AccountsView";
 import { ProfilesView } from "./components/ProfilesView";
 import { MediaDetail } from "./components/MediaDetail";
 import { DownloadManager, DownloadProvider } from "./components/Downloads";
 import { ToastProvider } from "./components/Toasts";
-import { downloadAvatar, getProfileStats, listAccounts, listProfiles } from "./lib/api";
+import { AboutView } from "./components/AboutView";
+import { CommandPalette } from "./components/CommandPalette";
+import { UpdaterProvider } from "./components/Updater";
+import { downloadAvatar, getProfileStats, listAccounts, listProfiles, warmSearchEngine } from "./lib/api";
 import type { AccountInfo, Kind, Profile, ProfileStats } from "./types";
 import "./App.css";
 
@@ -37,6 +40,10 @@ function Shell() {
     load().catch(() => setFirstLoad(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (accountId) void warmSearchEngine().catch(() => undefined);
+  }, [accountId]);
 
   // Localiza la foto de perfil: el WebView no carga bien la CDN (URLs firmadas
   // que expiran + IPv6 caído), así que se descarga una vez en Rust y se sirve
@@ -137,6 +144,8 @@ function Shell() {
                   setAccountId={setAccountId}
                   onChanged={onChanged}
                 />
+              ) : view === "about" ? (
+                <AboutView profiles={profiles.length} media={mediaTotal} downloaded={downloadedTotal} />
               ) : (
                 <ProfilesView
                   profiles={profiles}
@@ -156,6 +165,10 @@ function Shell() {
         onClose={() => setDlOpen(false)}
         accountId={accountId}
       />
+      <CommandPalette
+        navigate={(next) => { setView(next); setDetail(null); }}
+        openDownloads={() => setDlOpen(true)}
+      />
     </div>
     </DownloadProvider>
   );
@@ -164,7 +177,7 @@ function Shell() {
 export default function App() {
   return (
     <ToastProvider>
-      <Shell />
+      <UpdaterProvider><Shell /></UpdaterProvider>
     </ToastProvider>
   );
 }

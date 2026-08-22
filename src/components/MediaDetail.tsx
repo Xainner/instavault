@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -25,7 +25,8 @@ import {
 import type { Kind, Media, Profile, ProfileStats } from "../types";
 import {
   clearDownloads,
-  copyFileTo,
+  exportAvatar,
+  exportMedia,
   deleteProfile,
   downloadMedia,
   downloadProfile,
@@ -170,13 +171,15 @@ export function MediaDetail({
   }, [prof.id]);
 
   /// "Guardar en este equipo": diálogo de destino + copia del archivo local.
-  const saveToPC = async (localPath: string | null, filename: string) => {
-    if (!localPath || saving) return;
+  const saveToPC = async (target: { mediaId?: number; avatarId?: number }, filename: string) => {
+    if ((!target.mediaId && !target.avatarId) || saving) return;
     setSaving(true);
     try {
       const dest = await save({ defaultPath: filename });
       if (!dest) return;
-      const out = await copyFileTo(localPath, dest);
+      const out = target.mediaId
+        ? await exportMedia(target.mediaId, dest)
+        : await exportAvatar(target.avatarId!, dest);
       toast("success", "Guardado en tu equipo", out);
     } catch (e) {
       toast("error", "No se pudo guardar", String(e));
@@ -308,8 +311,9 @@ export function MediaDetail({
       return n;
     });
 
+  const toMediaSrc = (path: string) => path.includes("vault.localhost") ? path : convertFileSrc(path);
   const thumb = (m: Media) =>
-    m.local_path ? convertFileSrc(m.local_path) : m.thumbnail_url;
+    m.local_path ? toMediaSrc(m.local_path) : m.thumbnail_url;
 
   const kindStats = isKind(kind) ? (stats?.kinds.find((k) => k.kind === kind) ?? null) : null;
   const failedCount = media.filter((m) => m.status === "failed").length;
@@ -382,7 +386,7 @@ export function MediaDetail({
 
         <button
           className="btn ghost sm"
-          onClick={() => saveToPC(prof.avatar_local_path, `avatar_${prof.username}.jpg`)}
+          onClick={() => saveToPC({ avatarId: prof.id ?? undefined }, `avatar_${prof.username}.jpg`)}
           disabled={!prof.avatar_local_path || saving}
           title="Guardar foto de perfil en este equipo"
         >
@@ -512,7 +516,7 @@ export function MediaDetail({
                     // (el <img> con bytes MP4 siempre fallaría).
                     <video
                       key={m.local_path}
-                      src={convertFileSrc(m.local_path)}
+                      src={toMediaSrc(m.local_path)}
                       preload="metadata"
                       muted
                       className="media-video"
@@ -589,7 +593,7 @@ export function MediaDetail({
 {(() => {
                  const isVideo = light.media_type === 2;
                  const src = light.local_path
-                   ? convertFileSrc(light.local_path)
+                   ? toMediaSrc(light.local_path)
                    : (light.best_url ?? light.thumbnail_url) ?? "";
                  return isVideo ? (
                    <video
@@ -629,8 +633,8 @@ export function MediaDetail({
                       disabled={saving}
                       onClick={() =>
                         saveToPC(
-                          light.local_path,
-                          (light.local_path ?? "").split(/[\\/]/).pop() || "archivo",
+                          { mediaId: light.id ?? undefined },
+                          `${light.code || light.media_id}.${light.media_type === 2 ? "mp4" : "jpg"}`,
                         )
                       }
                       title="Copiar este archivo a una carpeta de tu equipo"

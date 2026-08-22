@@ -175,11 +175,19 @@ pub async fn fetch_highlight_media(
 /// candidato SIN límite de píxeles (resolución original, p.ej. 1179x2096),
 /// y las firmas de CDN siempre son frescas. `media_id` acepta los formatos
 /// de la BD: `{pk}`, `{pk}_{idx}` (carousel), `st_{pk}`, `hl_{pk}`.
-pub async fn fetch_media_info_url(
+#[derive(Debug, Clone)]
+pub struct MediaCandidate {
+    pub url: String,
+    pub width: i64,
+    pub height: i64,
+    pub bitrate: i64,
+}
+
+pub async fn fetch_media_info_candidate(
     ig: &IgClient,
     session: &Session,
     media_id: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<MediaCandidate>> {
     let (pk, child_idx) = if let Some((p, i)) = media_id
         .strip_prefix("st_")
         .or_else(|| media_id.strip_prefix("hl_"))
@@ -218,27 +226,46 @@ pub async fn fetch_media_info_url(
             .context("info: índice de carousel inválido")?,
         None => item,
     };
-    Ok(best_candidate_url(target))
+    Ok(best_candidate(target))
 }
 
-/// URL del candidato más grande (ancho*alto) de un item JSON.
-fn best_candidate_url(item: &serde_json::Value) -> Option<String> {
+/// Candidato de mayor calidad: resolución y, para videos empatados, bitrate.
+fn best_candidate(item: &serde_json::Value) -> Option<MediaCandidate> {
+    let videos = item
+        .get("video_versions")
+        .and_then(|v| v.as_array())
+        .and_then(|versions| {
+            versions
+                .iter()
+                .filter_map(|c| {
+                    Some(MediaCandidate {
+                        width: c.get("width")?.as_i64()?,
+                        height: c.get("height")?.as_i64()?,
+                        bitrate: c.get("bit_rate").and_then(|v| v.as_i64()).unwrap_or(0),
+                        url: c.get("url")?.as_str()?.to_string(),
+                    })
+                })
+                .max_by_key(|c| (c.width * c.height, c.bitrate, c.width))
+        });
+    if videos.is_some() {
+        return videos;
+    }
     item.get("image_versions2")
         .and_then(|iv| iv.get("candidates"))
         .and_then(|c| c.as_array())
-        .map(|cands| {
+        .and_then(|cands| {
             cands
                 .iter()
                 .filter_map(|c| {
-                    let w = c.get("width")?.as_u64()?;
-                    let h = c.get("height")?.as_u64()?;
-                    let u = c.get("url")?.as_str()?;
-                    Some(((w * h), u))
+                    Some(MediaCandidate {
+                        width: c.get("width")?.as_i64()?,
+                        height: c.get("height")?.as_i64()?,
+                        bitrate: 0,
+                        url: c.get("url")?.as_str()?.to_string(),
+                    })
                 })
-                .max_by_key(|(k, _)| *k)
-                .map(|(_, u)| u.to_string())
+                .max_by_key(|c| (c.width * c.height, c.width))
         })
-        .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +328,7 @@ fn best_url(item: &FeedItem) -> Option<String> {
         // video → mejor resolución
         item.video_versions
             .as_ref()
-            .and_then(|v| v.iter().max_by_key(|x| x.width * x.height))
+            .and_then(|v| v.iter().max_by_key(|x| (x.width * x.height, x.bit_rate.unwrap_or(0), x.width)))
             .map(|v| v.url.clone())
     } else {
         // foto → mejor resolución
@@ -324,4 +351,33 @@ fn thumb_url(item: &FeedItem) -> Option<String> {
 fn urlencoding(s: &str) -> String {
     // encode solo los caracteres esenciales para el query
     s.replace(':', "%3A")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::best_candidate;
+
+    #[test]
+    fn picks_largest_image_candidate() {
+        let item = serde_json::json!({"image_versions2":{"candidates":[
+            {"url":"small","width":320,"height":320},
+            {"url":"largest","width":1440,"height":1800},
+            {"url":"medium","width":1080,"height":1350}
+        ]}});
+        let best = best_candidate(&item).unwrap();
+        assert_eq!(best.url, "largest");
+        assert_eq!((best.width, best.height), (1440, 1800));
+    }
+
+    #[test]
+    fn video_resolution_then_bitrate_wins() {
+        let item = serde_json::json!({"video_versions":[
+            {"url":"low","width":1080,"height":1920,"bit_rate":1200},
+            {"url":"high","width":1080,"height":1920,"bit_rate":4800},
+            {"url":"small","width":720,"height":1280,"bit_rate":9000}
+        ]});
+        let best = best_candidate(&item).unwrap();
+        assert_eq!(best.url, "high");
+        assert_eq!(best.bitrate, 4800);
+    }
 }

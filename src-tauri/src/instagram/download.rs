@@ -12,6 +12,16 @@ struct ItemResult {
     error: Option<String>,
 }
 
+struct DownloadedContent {
+    bytes: Vec<u8>,
+    mime_type: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    bitrate: Option<i64>,
+    quality_verified: bool,
+    source: &'static str,
+}
+
 /// Descarga un lote de medios hacia disco y escribe el estado en BD.
 /// `on_progress` recibe un snapshot tras cada ítem finalizado (el emisor
 /// decide a dónde llevarlo: evento Tauri, log, etc.). Devuelve el resumen
@@ -77,9 +87,19 @@ where
                 .or_else(|| Some(row.media_id.clone()))
                 .unwrap_or_default();
             let (ok, err) = match download_one(&ig, &session, &row, &base_dir, &username, job_id).await {
-                Ok(path) => {
-                    let _ = db.lock().unwrap().mark_downloaded(db_id, &path);
-                    (true, None)
+                Ok(content) => {
+                    let saved = db.lock().unwrap().store_media_content(
+                        db_id, &content.bytes, &content.mime_type, content.width,
+                        content.height, content.bitrate, content.quality_verified, content.source,
+                    );
+                    match saved {
+                        Ok(()) => (true, None),
+                        Err(e) => {
+                            let message = format!("no se pudo guardar en SQLite: {e}");
+                            let _ = db.lock().unwrap().mark_failed(db_id, &message);
+                            (false, Some(message))
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = db.lock().unwrap().mark_failed(db_id, &e.to_string());
@@ -153,52 +173,51 @@ async fn download_one(
     base_dir: &Path,
     username: &str,
     job_id: i64,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<DownloadedContent> {
     let mut url = row.best_url.as_deref().context("sin best_url")?.to_string();
-    // Imágenes: media/{pk}/info/ (el endpoint de la web) da la mejor versión
-    // disponible — para stories/highlights es la resolución original sin
-    // límite de píxeles — y siempre con firma de CDN fresca (las URLs
-    // guardadas expiran). Si falla, se descarga con la URL guardada.
-    if row.media_type == Some(1) {
-        if let Ok(Some(fresh)) = super::api::fetch_media_info_url(ig, session, &row.media_id).await {
-            url = fresh;
+    let mut width = None;
+    let mut height = None;
+    let mut bitrate = None;
+    let mut quality_verified = false;
+    for attempt in 0..2 {
+        match super::api::fetch_media_info_candidate(ig, session, &row.media_id).await {
+            Ok(Some(fresh)) => {
+                url = fresh.url;
+                width = Some(fresh.width);
+                height = Some(fresh.height);
+                bitrate = (fresh.bitrate > 0).then_some(fresh.bitrate);
+                quality_verified = true;
+                break;
+            }
+            _ if attempt == 0 => tokio::time::sleep(std::time::Duration::from_millis(450)).await,
+            _ => break,
         }
     }
-    let dir = base_dir.join(username).join(&row.kind);
-    std::fs::create_dir_all(&dir)?;
-
-    // Los videos de IG no traen extensión confiable en la URL CDN.
-    let ext = if row.media_type == Some(2) {
-        "mp4".to_string()
-    } else {
-        extension_from_url(&url).unwrap_or_else(|| "jpg".to_string())
-    };
-    let stem = sanitize_filename(if let Some(code) = &row.code {
-        code.as_str()
-    } else {
-        row.media_id.as_str()
-    });
-    let final_path = dir.join(format!("{stem}.{ext}"));
-
-    // Dedup: ya existe y no está vacío → hecho
-    if final_path.exists() && final_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        return Ok(final_path.to_string_lossy().to_string());
-    }
+    let _ = (base_dir, username, job_id);
 
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..3 {
-        let tmp = dir.join(format!(".{stem}.{ext}.part{attempt}.{job_id}"));
         let req = ig.http().get(&url);
         match req.send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     last_err = Some(anyhow::anyhow!("HTTP {}", resp.status()));
                 } else {
+                    let mime = resp.headers().get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok()).unwrap_or(
+                            if row.media_type == Some(2) { "video/mp4" } else { "image/jpeg" }
+                        ).split(';').next().unwrap_or("application/octet-stream").to_string();
                     match resp.bytes().await {
                         Ok(bytes) => {
-                            tokio::fs::write(&tmp, &bytes).await?;
-                            std::fs::rename(&tmp, &final_path)?;
-                            return Ok(final_path.to_string_lossy().to_string());
+                            if bytes.is_empty() {
+                                last_err = Some(anyhow::anyhow!("respuesta vacía"));
+                            } else {
+                                return Ok(DownloadedContent {
+                                    bytes: bytes.to_vec(), mime_type: mime, width, height, bitrate,
+                                    quality_verified,
+                                    source: if quality_verified { "fresh_info" } else { "feed_fallback" },
+                                });
+                            }
                         }
                         Err(e) => last_err = Some(e.into()),
                     }
@@ -211,6 +230,7 @@ async fn download_one(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("descarga fallida")))
 }
 
+#[allow(dead_code)]
 fn extension_from_url(url: &str) -> Option<String> {
     let p = url.split('?').next().unwrap_or(url);
     let path = std::path::PathBuf::from(p);
@@ -224,24 +244,4 @@ fn extension_from_url(url: &str) -> Option<String> {
                 e.to_string()
             }
         })
-}
-
-fn sanitize_filename(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if out.is_empty() {
-        out = "media".to_string();
-    }
-    if out.len() > 80 {
-        out.truncate(80);
-    }
-    out
 }

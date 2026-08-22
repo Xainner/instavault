@@ -334,10 +334,11 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
                             credentials: 'include'
                         }});
                         const t = await res.text();
-                        if (res.status === 429 || res.status === 400) {{
+                        if (res.status === 429) {{
                             await new Promise(r => setTimeout(r, 1500 * (i + 1)));
                             continue;
                         }}
+                        if (res.status === 400) return {{ok:false, why:'http400'}};
                         if (res.status === 403) return {{ok:false, why:'forbidden'}};
                         if (res.status === 404) return {{ok:false, why:'notFound'}};
                         if (res.status >= 400) return {{ok:false, why:'http'+res.status}};

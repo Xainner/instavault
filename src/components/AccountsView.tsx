@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
+import { useForm } from "react-hook-form";
 import {
   BadgeCheck,
   Check,
@@ -120,8 +121,9 @@ export function AccountsView({
   };
 
   // Modal alta
-  const [username, setUsername] = useState("");
-  const [cookies, setCookies] = useState("");
+  const { register, handleSubmit, reset } = useForm<{ username: string; cookies: string }>({
+    defaultValues: { username: "", cookies: "" },
+  });
   const [err, setErr] = useState<string | null>(null);
 
   // Perfiles de navegador detectados
@@ -154,7 +156,7 @@ export function AccountsView({
     }
   };
 
-  const doAdd = async () => {
+  const doAdd = async ({ username, cookies }: { username: string; cookies: string }) => {
     if (!username.trim()) return setErr("Pon el usuario de la cuenta.");
     if (!cookies.includes("sessionid="))
       return setErr("Las cookies deben incluir sessionid=...");
@@ -164,8 +166,7 @@ export function AccountsView({
       const acc = await addAccount(username.trim().replace(/^@/, ""), cookies.trim());
       toast("success", `@${acc.username} agregada`);
       setAddOpen(false);
-      setUsername("");
-      setCookies("");
+      reset();
       setAccountId(acc.id);
       onChanged();
       // validar en segundo plano
@@ -441,8 +442,7 @@ export function AccountsView({
               <input
                 className="input"
                 placeholder="mi_usuario"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                {...register("username", { required: true })}
                 autoFocus
               />
             </label>
@@ -451,8 +451,7 @@ export function AccountsView({
               <textarea
                 className="input cookies"
                 placeholder={COOKIES_EXAMPLE}
-                value={cookies}
-                onChange={(e) => setCookies(e.target.value)}
+                {...register("cookies", { required: true, validate: (v) => v.includes("sessionid=") })}
                 rows={4}
               />
               <span className="hint">
@@ -474,7 +473,7 @@ export function AccountsView({
             Cancelar
           </button>
           {addTab === "manual" && (
-            <button className="btn primary" onClick={doAdd} disabled={busy}>
+            <button className="btn primary" onClick={handleSubmit(doAdd)} disabled={busy}>
               {busy ? <Loader2 size={15} className="spin" /> : <Plus size={15} />}
               {busy ? "Guardando…" : "Agregar cuenta"}
             </button>

@@ -26,6 +26,7 @@ export const deleteAccount = (accountId: number) =>
 // Perfiles
 export const fetchProfile = (accountId: number, username: string) =>
   invoke<Profile>("fetch_profile", { accountId, username });
+export const warmSearchEngine = () => invoke<void>("warm_search_engine");
 
 export const listProfiles = () => invoke<Profile[]>("list_profiles");
 
@@ -87,8 +88,11 @@ export const listDownloadJobs = (limit = 30) =>
 export const clearFinishedJobs = () => invoke<void>("clear_finished_jobs");
 
 /// Copia un archivo local a un destino elegido por el usuario.
-export const copyFileTo = (source: string, dest: string) =>
-  invoke<string>("copy_file_to", { source, dest });
+export const exportMedia = (mediaPk: number, dest: string) =>
+  invoke<string>("export_media", { mediaPk, dest });
+
+export const exportAvatar = (profileId: number, dest: string) =>
+  invoke<string>("export_avatar", { profileId, dest });
 
 /// Suscripción a eventos de progreso (1 por ítem descargado).
 export const onDownloadProgress = (cb: (p: DownloadProgress) => void) =>
