@@ -1,5 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AccountInfo, Kind, Media, Profile } from "../types";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  AccountInfo,
+  DownloadJob,
+  DownloadProgress,
+  DownloadSummary,
+  Kind,
+  Media,
+  Profile,
+  ProfileStats,
+} from "../types";
 
 // Cuentas
 export const addAccount = (username: string, cookieHeader: string) =>
@@ -41,7 +51,48 @@ export const downloadProfile = (
   profileId: number,
   kind: Kind,
   concurrency = 4,
-) => invoke<[number, number]>("download_profile", { accountId, profileId, kind, concurrency });
+  includeFailed = false,
+) =>
+  invoke<DownloadSummary>("download_profile", {
+    accountId,
+    profileId,
+    kind,
+    concurrency,
+    includeFailed,
+  });
+
+export const downloadMedia = (accountId: number, mediaPk: number) =>
+  invoke<DownloadSummary>("download_media", { accountId, mediaPk });
+
+/// Borra el archivo local de un medio y lo vuelve a pendiente.
+export const resetDownload = (mediaPk: number) =>
+  invoke<void>("reset_download", { mediaPk });
+
+/// Borra todos los archivos descargados de un perfil (o un kind).
+export const clearDownloads = (profileId: number, kind?: Kind | null) =>
+  invoke<number>("clear_downloads", { profileId, kind: kind ?? null });
+
+// Estado / favoritos / jobs
+export const setProfileFavorite = (profileId: number, favorite: boolean) =>
+  invoke<void>("set_profile_favorite", { profileId, favorite });
+
+export const downloadAvatar = (profileId: number) =>
+  invoke<string | null>("download_avatar", { profileId });
+
+export const getProfileStats = () => invoke<ProfileStats[]>("get_profile_stats");
+
+export const listDownloadJobs = (limit = 30) =>
+  invoke<DownloadJob[]>("list_download_jobs", { limit });
+
+export const clearFinishedJobs = () => invoke<void>("clear_finished_jobs");
+
+/// Copia un archivo local a un destino elegido por el usuario.
+export const copyFileTo = (source: string, dest: string) =>
+  invoke<string>("copy_file_to", { source, dest });
+
+/// Suscripción a eventos de progreso (1 por ítem descargado).
+export const onDownloadProgress = (cb: (p: DownloadProgress) => void) =>
+  listen<DownloadProgress>("download:progress", (e) => cb(e.payload)) as Promise<UnlistenFn>;
 
 // Navegador
 export interface BrowserProfile {

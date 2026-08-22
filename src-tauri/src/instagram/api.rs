@@ -124,6 +124,28 @@ pub async fn fetch_highlights_tray(
     Ok(resp.tray.unwrap_or_default())
 }
 
+/// Lee media de uno o varios reels (ids ya limpios, p.ej.
+/// `highlight:123,highlight:456`). Endpoint mobile genérico de reels.
+pub async fn fetch_reels_media(
+    ig: &IgClient,
+    session: &Session,
+    reel_ids: &str,
+) -> anyhow::Result<Vec<FeedItem>> {
+    let url = format!(
+        "{API_BASE}/feed/reels_media/?reel_ids={}",
+        urlencoding(reel_ids)
+    );
+    let resp: ReelsMediaResponse = ig
+        .get_json(&url, session)
+        .await
+        .context("fallo al leer reels media")?;
+    let mut out = Vec::new();
+    for reel in resp.reels.values() {
+        out.extend(reel.items.clone());
+    }
+    Ok(out)
+}
+
 pub async fn fetch_highlight_media(
     ig: &IgClient,
     session: &Session,
@@ -146,6 +168,77 @@ pub async fn fetch_highlight_media(
         out.extend(reel.items.clone());
     }
     Ok(out)
+}
+
+/// Mejor URL de UN medio vía `media/{pk}/info/` (el endpoint que usa la web).
+/// A diferencia de feed/reels_media, para stories/highlights devuelve el
+/// candidato SIN límite de píxeles (resolución original, p.ej. 1179x2096),
+/// y las firmas de CDN siempre son frescas. `media_id` acepta los formatos
+/// de la BD: `{pk}`, `{pk}_{idx}` (carousel), `st_{pk}`, `hl_{pk}`.
+pub async fn fetch_media_info_url(
+    ig: &IgClient,
+    session: &Session,
+    media_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let (pk, child_idx) = if let Some((p, i)) = media_id
+        .strip_prefix("st_")
+        .or_else(|| media_id.strip_prefix("hl_"))
+        .unwrap_or(media_id)
+        .split_once('_')
+    {
+        (p, i.parse::<usize>().ok())
+    } else {
+        (
+            media_id.strip_prefix("st_").unwrap_or(media_id),
+            None,
+        )
+    };
+    let url = format!("{API_BASE}/media/{pk}/info/");
+    let v: serde_json::Value = ig
+        .get_json(&url, session)
+        .await
+        .context("fallo al leer media info")?;
+    // El item viene directo o envuelto en items[]
+    let item: &serde_json::Value = if v.get("image_versions2").is_some()
+        || v.get("carousel_media").is_some()
+    {
+        &v
+    } else {
+        v.get("items")
+            .and_then(|i| i.as_array())
+            .and_then(|a| a.first())
+            .context("info sin item")?
+    };
+    // Carousel → hijo del índice; simple → el propio item
+    let target = match child_idx {
+        Some(i) => item
+            .get("carousel_media")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.get(i))
+            .context("info: índice de carousel inválido")?,
+        None => item,
+    };
+    Ok(best_candidate_url(target))
+}
+
+/// URL del candidato más grande (ancho*alto) de un item JSON.
+fn best_candidate_url(item: &serde_json::Value) -> Option<String> {
+    item.get("image_versions2")
+        .and_then(|iv| iv.get("candidates"))
+        .and_then(|c| c.as_array())
+        .map(|cands| {
+            cands
+                .iter()
+                .filter_map(|c| {
+                    let w = c.get("width")?.as_u64()?;
+                    let h = c.get("height")?.as_u64()?;
+                    let u = c.get("url")?.as_str()?;
+                    Some(((w * h), u))
+                })
+                .max_by_key(|(k, _)| *k)
+                .map(|(_, u)| u.to_string())
+        })
+        .flatten()
 }
 
 // ---------------------------------------------------------------------------

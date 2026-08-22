@@ -47,31 +47,40 @@ impl CdpSession {
     }
 
     /// Lanza el navegador para el login asistido (fuerza logout primero).
+    /// Siempre visible: el usuario tiene que interactuar para loguearse.
     pub fn launch() -> Result<Self> {
-        Self::launch_with_url("https://www.instagram.com/accounts/logout/")
+        Self::launch_with_url("https://www.instagram.com/accounts/logout/", false)
     }
 
     /// Lanza el navegador como motor de API (home; conserva la sesión del perfil).
     /// Instagram bloquea (429) los clientes HTTP externos, así que todas las
-    /// llamadas pasan por el propio Chrome vía CDP.
+    /// llamadas pasan por el propio Chrome vía CDP. Corre en headless: es
+    /// fire-and-forget y no debe mostrar ventanas al usuario.
     pub fn launch_api() -> Result<Self> {
-        Self::launch_with_url("https://www.instagram.com/")
+        Self::launch_with_url("https://www.instagram.com/", true)
     }
 
-    fn launch_with_url(start_url: &str) -> Result<Self> {
+    fn launch_with_url(start_url: &str, headless: bool) -> Result<Self> {
         let exe = find_chromium()?;
         let port = free_port()?;
         let profile_dir = profile_dir()?;
         std::fs::create_dir_all(&profile_dir).context("no se pudo crear el perfil del navegador")?;
 
+        let mut args: Vec<String> = vec![
+            format!("--remote-debugging-port={port}"),
+            format!("--user-data-dir={}", profile_dir.display()),
+            "--no-first-run".into(),
+            "--no-default-browser-check".into(),
+        ];
+        if headless {
+            args.push("--headless=new".into());
+            // Viewport estable: el fallback que parsea HTML asume layout normal.
+            args.push("--window-size=1280,800".into());
+        }
+        args.push(start_url.to_string());
+
         let child = Command::new(&exe)
-            .args([
-                &format!("--remote-debugging-port={port}"),
-                &format!("--user-data-dir={}", profile_dir.display()),
-                "--no-first-run",
-                "--no-default-browser-check",
-                start_url,
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -354,10 +363,11 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
                         if (res.status === 404) return {{ok:false, why:'notFound'}};
                         const m = t.match(/"username":"([^"]{{2,30}})"/);
                         const mid = t.match(/"id":"([0-9]+)"/);
-                        if (m) {{
-                            const id = mid ? mid[1] : u;
-                            return {{ok:true, v:{{data:{{user:{{id: id, username: m[1], full_name: null, biography: null, profile_pic_url_hd: null, is_private: false, is_verified: false, edge_followed_by: {{count: 0}}, edge_follow: {{count: 0}}, edge_owner_to_timeline_media: {{count: 0}}}}}}}}}};
-                        }}
+if (m) {{
+                    // null = desconocido: el upsert con COALESCE no pisa datos reales.
+                    // (si no hay id numerico, id=null: usar el username romperia la sync de feed)
+                    return {{ok:true, v:{{data:{{user:{{id: mid ? mid[1] : null, username: m[1], full_name: null, biography: null, profile_pic_url_hd: null, is_private: null, is_verified: null, edge_followed_by: null, edge_follow: null, edge_owner_to_timeline_media: null}}}}}}}};
+                }}
                         return {{ok:false, why:'noUsername'}};
                     }} catch(e) {{ return {{ok:false, why:'err2'}}; }}
                 }}
@@ -452,6 +462,97 @@ pub fn navigate_home(port: u16) -> Result<()> {
     // Deja que la home cargue y valide la sesión.
     std::thread::sleep(Duration::from_secs(6));
     Ok(())
+}
+
+/// Navega la página actual a una URL arbitraria de Instagram.
+/// A diferencia de `navigate_home`, no duerme: el llamador decide cuánto
+/// esperar a que la página renderice.
+pub fn navigate_to(port: u16, url: &str) -> Result<()> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Page.navigate",
+            "params": {"url": url}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error navegando: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout navegando a {url}"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
+}
+
+/// Extrae los highlight reels de la página de perfil renderizada
+/// (`a[href*="/stories/highlights/{id}/"]`). El endpoint mobile
+/// `highlights_tray` está caído; la página los muestra igual (aunque el
+/// navegador esté logged-out), así que el DOM es la fuente confiable.
+pub fn extract_highlight_reels(port: u16) -> Result<Vec<super::models::HighlightReel>> {
+    let ws_url = page_ws_url(port)?;
+    let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
+        .map_err(|e| anyhow!("no se pudo conectar al CDP: {e}"))?;
+    let expr = r#"(() => {
+        const out = [];
+        document.querySelectorAll('a[href*="/stories/highlights/"]').forEach(a => {
+            const m = a.href.match(/\/stories\/highlights\/(\d+)/);
+            if (!m) return;
+            const title = (a.innerText || a.getAttribute('aria-label') || '').trim();
+            if (!out.some(o => o.id === m[1])) {
+                out.push({ id: m[1], title: title.slice(0, 80) });
+            }
+        });
+        return out;
+    })()"#;
+    use tungstenite::Message;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expr, "returnByValue": true}
+        })
+        .to_string(),
+    ))
+    .map_err(|e| anyhow!("error enviando comando CDP: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timeout esperando los highlights del DOM"));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t)
+                    .map_err(|e| anyhow!("CDP devolvió JSON inválido: {e}"))?;
+                if v.get("id").and_then(|i| i.as_u64()) != Some(1) {
+                    continue;
+                }
+                let val = v
+                    .pointer("/result/result/value")
+                    .ok_or_else(|| anyhow!("DOM sin resultado"))?;
+                let reels: Vec<super::models::HighlightReel> = serde_json::from_value(val.clone())
+                    .map_err(|e| anyhow!("parseo de highlights: {e}"))?;
+                return Ok(reels);
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("error leyendo del CDP: {e}")),
+        }
+    }
 }
 
 /// GET HTTP mínimo que parsea la respuesta JSON (expuesto para diagnóstico).

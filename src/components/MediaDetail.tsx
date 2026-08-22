@@ -1,28 +1,37 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   ArrowLeft,
   CheckCircle2,
+  Clock,
   Download,
   FileImage,
   Film,
+  FolderDown,
   FolderOpen,
   Images,
   LayoutGrid,
   Loader2,
   MoreVertical,
+  RotateCcw,
   RefreshCw,
   Star,
   Trash2,
   Video,
 } from "lucide-react";
-import type { Kind, Media, Profile } from "../types";
+import type { Kind, Media, Profile, ProfileStats } from "../types";
 import {
+  clearDownloads,
+  copyFileTo,
   deleteProfile,
+  downloadMedia,
   downloadProfile,
   getMedia,
+  onDownloadProgress,
+  resetDownload,
   syncHighlights,
   syncPosts,
   syncStories,
@@ -31,11 +40,16 @@ import { useToast } from "./Toasts";
 import { Modal } from "./Modal";
 import { ProfileAvatar, fmtDate, fmtInt } from "./ProfilesView";
 
-const KINDS: { id: Kind; label: string; icon: React.ReactNode }[] = [
+type Tab = Kind | "album";
+
+const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "post", label: "Posts", icon: <Images size={14} /> },
   { id: "story", label: "Stories", icon: <Film size={14} /> },
   { id: "highlight", label: "Highlights", icon: <Star size={14} /> },
+  { id: "album", label: "Álbum", icon: <FolderDown size={14} /> },
 ];
+
+const isKind = (t: Tab): t is Kind => t !== "album";
 
 function mediaIcon(m: Media) {
   if (m.media_type === 2) return <Video size={13} />;
@@ -43,37 +57,63 @@ function mediaIcon(m: Media) {
   return <FileImage size={13} />;
 }
 
+function CellImg({ src, alt }: { src: string | null; alt: string }) {
+  const [err, setErr] = useState(false);
+  // Un src nuevo (re-sync con URLs frescas) puede ser válido de nuevo.
+  useEffect(() => setErr(false), [src]);
+  if (!src || err)
+    return (
+      <div className="media-noimg">
+        <FileImage size={26} />
+      </div>
+    );
+  return <img src={src} alt={alt} loading="lazy" onError={() => setErr(true)} />;
+}
+
 export function MediaDetail({
   prof,
   kind: initialKind,
   accountId,
+  stats,
   onBack,
   onChanged,
 }: {
   prof: Profile;
   kind: Kind;
   accountId: number;
+  stats: ProfileStats | null;
   onBack: () => void;
   onChanged: () => void;
 }) {
   const { toast } = useToast();
-  const [kind, setKind] = useState<Kind>(initialKind);
+  const [kind, setKind] = useState<Tab>(initialKind);
   const [media, setMedia] = useState<Media[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState<"sync" | "download" | null>(null);
+  const [busy, setBusy] = useState<"sync" | "download" | "retry" | null>(null);
   const [menu, setMenu] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [light, setLight] = useState<Media | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [dlOne, setDlOne] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [reDl, setReDl] = useState<number | null>(null);
+  const [clearConfirm, setClearConfirm] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const autoSynced = useRef(false);
 
   const load = async () => {
     setLoading(true);
     try {
       const all = await getMedia(prof.id!);
-      setMedia(all.filter((m) => m.kind === kind));
+      setMedia(
+        kind === "album"
+          ? all.filter((m) => m.status === "downloaded")
+          : all.filter((m) => m.kind === kind),
+      );
       const c: Record<string, number> = {};
       for (const m of all) c[m.kind] = (c[m.kind] || 0) + 1;
+      c.album = all.filter((m) => m.status === "downloaded").length;
       setCounts(c);
     } catch (e) {
       toast("error", "Error al cargar medios", String(e));
@@ -87,7 +127,78 @@ export function MediaDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind]);
 
+  // Auto-sync al abrir un perfil vacío (p.ej. recién buscado): trae posts,
+  // stories y highlights de una vez, solo metadatos (sin descargar).
+  useEffect(() => {
+    if (autoSynced.current || !prof.id || busy) return;
+    autoSynced.current = true;
+    (async () => {
+      try {
+        const all = await getMedia(prof.id!);
+        if (all.length > 0) return;
+        setBusy("sync");
+        let n = 0;
+        try {
+          n += await syncPosts(accountId, prof.username, 4);
+        } catch {
+          /* un kind fallido no frena el resto */
+        }
+        try {
+          n += await syncStories(accountId, prof.username);
+        } catch {
+          /* noop */
+        }
+        try {
+          n += await syncHighlights(accountId, prof.username);
+        } catch {
+          /* noop */
+        }
+        toast(
+          n > 0 ? "success" : "info",
+          "Sincronización automática",
+          n > 0 ? `${n} medios en la base.` : "No se encontraron medios.",
+        );
+        load();
+        onChanged();
+      } catch {
+        /* noop */
+      } finally {
+        setBusy(null);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prof.id]);
+
+  /// "Guardar en este equipo": diálogo de destino + copia del archivo local.
+  const saveToPC = async (localPath: string | null, filename: string) => {
+    if (!localPath || saving) return;
+    setSaving(true);
+    try {
+      const dest = await save({ defaultPath: filename });
+      if (!dest) return;
+      const out = await copyFileTo(localPath, dest);
+      toast("success", "Guardado en tu equipo", out);
+    } catch (e) {
+      toast("error", "No se pudo guardar", String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Un job que termine (iniciado desde otro lado) refresca la grilla.
+  // Depende de `kind`: load() filtra por la pestaña activa y el callback
+  // de listen captura la `load` del render en el que se suscribió.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    onDownloadProgress((p) => {
+      if (p.profile_id === prof.id && p.done >= p.total) load();
+    }).then((u) => (un = u));
+    return () => un?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prof.id, kind]);
+
   const doSync = async () => {
+    if (!isKind(kind)) return;
     setBusy("sync");
     try {
       let n = 0;
@@ -104,13 +215,16 @@ export function MediaDetail({
     }
   };
 
-  const doDownload = async () => {
-    setBusy("download");
+  const doDownload = async (includeFailed = false) => {
+    if (!isKind(kind)) return;
+    setBusy(includeFailed ? "retry" : "download");
     try {
-      const [ok, failed] = await downloadProfile(accountId, prof.id!, kind);
-      if (failed > 0)
-        toast("warning", "Descarga terminada", `${ok} descargados, ${failed} con errores.`);
-      else toast("success", "Descarga completa", `${ok} medios en tu biblioteca.`);
+      const s = await downloadProfile(accountId, prof.id!, kind, 4, includeFailed);
+      if (s.total === 0)
+        toast("info", "Nada que descargar", "Sincroniza antes para traer medios a la base.");
+      else if (s.failed > 0)
+        toast("warning", "Descarga terminada", `${s.ok} descargados, ${s.failed} con errores.`);
+      else toast("success", "Descarga completa", `${s.ok} medios en tu biblioteca.`);
       load();
       onChanged();
     } catch (e) {
@@ -120,12 +234,70 @@ export function MediaDetail({
     }
   };
 
+  const doDownloadOne = async (m: Media) => {
+    if (!m.id || dlOne != null) return;
+    setDlOne(m.id);
+    try {
+      const s = await downloadMedia(accountId, m.id);
+      if (s.failed > 0) toast("error", "No se pudo descargar", s.errors[0]?.error ?? "");
+      else toast("success", "Descargado", "El medio ya está en tu biblioteca.");
+      const st = s.failed ? "failed" : "downloaded";
+      setLight((l) => (l && l.id === m.id ? { ...l, status: st } : l));
+      load();
+      onChanged();
+    } catch (e) {
+      toast("error", "Error en la descarga", String(e));
+    } finally {
+      setDlOne(null);
+    }
+  };
+
   const doDelete = async () => {
     if (!prof.id) return;
     await deleteProfile(prof.id);
     toast("info", "Perfil eliminado");
     onChanged();
     onBack();
+  };
+
+  // Re-descargar un medio ya descargado: borra el archivo local (que puede
+  // ser de baja calidad) y lo baja de nuevo a máxima calidad / firma fresca.
+  const doRedownload = async (m: Media) => {
+    if (!m.id || reDl != null) return;
+    setReDl(m.id);
+    try {
+      await resetDownload(m.id);
+      const s = await downloadMedia(accountId, m.id);
+      if (s.failed > 0)
+        toast("error", "No se pudo re-descargar", s.errors[0]?.error ?? "");
+      else toast("success", "Re-descargado", "Versión de máxima calidad.");
+      const st = s.failed ? "failed" : "downloaded";
+      setLight((l) => (l && l.id === m.id ? { ...l, status: st } : l));
+      load();
+      onChanged();
+    } catch (e) {
+      toast("error", "Error al re-descargar", String(e));
+    } finally {
+      setReDl(null);
+    }
+  };
+
+  // Vaciar el álbum: borra todos los archivos descargados del perfil y los
+  // deja pendientes (la metadata se conserva para re-descargar).
+  const doClear = async () => {
+    if (!prof.id || clearing) return;
+    setClearing(true);
+    try {
+      const n = await clearDownloads(prof.id);
+      toast("success", "Álbum vaciado", `${n} archivos eliminados de tu equipo.`);
+      setClearConfirm(false);
+      load();
+      onChanged();
+    } catch (e) {
+      toast("error", "No se pudo vaciar el álbum", String(e));
+    } finally {
+      setClearing(false);
+    }
   };
 
   const toggleSel = (id: number) =>
@@ -139,6 +311,9 @@ export function MediaDetail({
   const thumb = (m: Media) =>
     m.local_path ? convertFileSrc(m.local_path) : m.thumbnail_url;
 
+  const kindStats = isKind(kind) ? (stats?.kinds.find((k) => k.kind === kind) ?? null) : null;
+  const failedCount = media.filter((m) => m.status === "failed").length;
+
   return (
     <div className="view">
       <div className="detail-head">
@@ -146,7 +321,7 @@ export function MediaDetail({
           <ArrowLeft size={15} /> Volver
         </button>
         <div className="detail-id">
-          <ProfileAvatar url={prof.profile_pic_url} name={prof.username} size={46} ring />
+          <ProfileAvatar url={prof.profile_pic_url} localPath={prof.avatar_local_path} name={prof.username} size={46} ring />
           <div>
             <div className="detail-name">
               {prof.full_name || prof.username}
@@ -156,6 +331,26 @@ export function MediaDetail({
               <b>{fmtInt(prof.media_count)}</b> posts · <b>{fmtInt(prof.followers)}</b>{" "}
               seguidores
             </div>
+            {kindStats && (
+              <div className="detail-sync">
+                <span>
+                  <b>{kindStats.local_count}</b> en base
+                </span>
+                <span className="ok">
+                  <Download size={11} /> {kindStats.downloaded} descargados
+                </span>
+                {failedCount > 0 && (
+                  <span className="err">
+                    <AlertTriangle size={11} /> {failedCount} fallidos
+                  </span>
+                )}
+                {kindStats.last_sync && (
+                  <span>
+                    <Clock size={11} /> sync {fmtDate(kindStats.last_sync)}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -171,9 +366,11 @@ export function MediaDetail({
                 exit={{ opacity: 0, scale: 0.94, y: -4 }}
                 className="dropdown right"
               >
-                <button onClick={() => { setMenu(false); doSync(); }}>
-                  <RefreshCw size={14} /> Sincronizar {KINDS.find((k) => k.id === kind)?.label}
-                </button>
+                {isKind(kind) && (
+                  <button onClick={() => { setMenu(false); doSync(); }}>
+                    <RefreshCw size={14} /> Sincronizar {TABS.find((k) => k.id === kind)?.label}
+                  </button>
+                )}
                 <div className="dropdown-sep" />
                 <button className="danger" onClick={() => { setMenu(false); setConfirm(true); }}>
                   <Trash2 size={14} /> Eliminar perfil
@@ -184,17 +381,50 @@ export function MediaDetail({
         </div>
 
         <button
-          className="btn primary sm"
-          onClick={doDownload}
-          disabled={busy !== null || media.filter((m) => m.status !== "downloaded").length === 0}
+          className="btn ghost sm"
+          onClick={() => saveToPC(prof.avatar_local_path, `avatar_${prof.username}.jpg`)}
+          disabled={!prof.avatar_local_path || saving}
+          title="Guardar foto de perfil en este equipo"
         >
-          {busy === "download" ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
-          Descargar pendientes
+          {saving ? <Loader2 size={14} className="spin" /> : <FolderDown size={14} />}
+          Foto de perfil
         </button>
+        {kind === "album" && (counts.album ?? 0) > 0 && (
+          <button
+            className="btn ghost sm danger"
+            onClick={() => setClearConfirm(true)}
+            disabled={clearing}
+            title="Borrar todos los archivos descargados de este perfil (la base de datos se conserva)"
+          >
+            {clearing ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />}
+            Vaciar álbum ({counts.album})
+          </button>
+        )}
+        {isKind(kind) && (
+          <button
+            className="btn primary sm"
+            onClick={() => doDownload(false)}
+            disabled={busy !== null || media.filter((m) => m.status !== "downloaded").length === 0}
+          >
+            {busy === "download" ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
+            Descargar pendientes
+          </button>
+        )}
+        {failedCount > 0 && (
+          <button
+            className="btn ghost sm warn"
+            onClick={() => doDownload(true)}
+            disabled={busy !== null}
+            title="Reintentar los medios fallidos"
+          >
+            {busy === "retry" ? <Loader2 size={14} className="spin" /> : <RotateCcw size={14} />}
+            Reintentar {failedCount}
+          </button>
+        )}
       </div>
 
       <div className="kind-tabs">
-        {KINDS.map((k) => (
+        {TABS.map((k) => (
           <button
             key={k.id}
             className={`kind-tab ${kind === k.id ? "active" : ""}`}
@@ -205,15 +435,17 @@ export function MediaDetail({
             <span className="kind-count">{counts[k.id] || 0}</span>
           </button>
         ))}
-        <button
-          className="btn ghost sm"
-          onClick={doSync}
-          disabled={busy !== null}
-          title={`Sincronizar ${KINDS.find((k) => k.id === kind)?.label}`}
-        >
-          {busy === "sync" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
-          Sincronizar
-        </button>
+        {isKind(kind) && (
+          <button
+            className="btn ghost sm"
+            onClick={doSync}
+            disabled={busy !== null}
+            title={`Sincronizar ${TABS.find((k) => k.id === kind)?.label}`}
+          >
+            {busy === "sync" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
+            Sincronizar
+          </button>
+        )}
       </div>
 
       <AnimatePresence mode="wait">
@@ -239,8 +471,20 @@ export function MediaDetail({
             <div className="empty-icon">
               <LayoutGrid size={30} />
             </div>
-            <h3>Sin {KINDS.find((k) => k.id === kind)?.label.toLowerCase()} todavía</h3>
-            <p>Usa “Sincronizar” para traer el contenido de este perfil a tu base de datos.</p>
+            {kind === "album" ? (
+              <>
+                <h3>Tu álbum está vacío</h3>
+                <p>
+                  Los medios que descargues de este perfil aparecerán aquí para verlos
+                  y copiarlos a donde quieras.
+                </p>
+              </>
+            ) : (
+              <>
+                <h3>Sin {TABS.find((k) => k.id === kind)?.label.toLowerCase()} todavía</h3>
+                <p>Usa “Sincronizar” para traer el contenido de este perfil a tu base de datos.</p>
+              </>
+            )}
           </motion.div>
         ) : (
           <motion.div
@@ -263,24 +507,48 @@ export function MediaDetail({
                   className={`media-cell ${sel ? "selected" : ""} ${m.status === "failed" ? "failed" : ""}`}
                   onClick={() => (t ? setLight(m) : toggleSel(m.id!))}
                 >
-                  {t ? (
-                    <img src={t} alt={m.caption ?? m.media_id} loading="lazy" />
+                  {m.media_type === 2 && m.local_path ? (
+                    // Video descargado: el primer frame sirve de portada local
+                    // (el <img> con bytes MP4 siempre fallaría).
+                    <video
+                      key={m.local_path}
+                      src={convertFileSrc(m.local_path)}
+                      preload="metadata"
+                      muted
+                      className="media-video"
+                    />
                   ) : (
-                    <div className="media-noimg">
-                      <FileImage size={26} />
-                    </div>
+                    <CellImg src={t} alt={m.caption ?? m.media_id} />
                   )}
                   <div className="media-veil">
                     <span className="media-kind">{mediaIcon(m)}</span>
-                    <span className={`media-status ${m.status}`}>
-                      {m.status === "downloaded" ? (
-                        <CheckCircle2 size={13} />
-                      ) : m.status === "failed" ? (
-                        <AlertTriangle size={13} />
-                      ) : (
-                        <Download size={13} />
+                    <div className="media-veil-right">
+                      {m.status === "failed" && (
+                        <button
+                          className="cell-retry"
+                          title="Reintentar descarga"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            doDownloadOne(m);
+                          }}
+                        >
+                          {dlOne === m.id ? (
+                            <Loader2 size={13} className="spin" />
+                          ) : (
+                            <RotateCcw size={13} />
+                          )}
+                        </button>
                       )}
-                    </span>
+                      <span className={`media-status ${m.status}`}>
+                        {m.status === "downloaded" ? (
+                          <CheckCircle2 size={13} />
+                        ) : m.status === "failed" ? (
+                          <AlertTriangle size={13} />
+                        ) : (
+                          <Download size={13} />
+                        )}
+                      </span>
+                    </div>
                   </div>
                 </motion.div>
               );
@@ -318,15 +586,85 @@ export function MediaDetail({
               transition={{ type: "spring", stiffness: 300, damping: 28 }}
               onClick={(e) => e.stopPropagation()}
             >
-              {light.local_path ? (
-                <img
-                  src={convertFileSrc(light.local_path)}
-                  alt={light.caption ?? light.media_id}
-                />
-              ) : (
-                <img src={light.thumbnail_url ?? ""} alt={light.caption ?? light.media_id} />
-              )}
-              {(light.caption || light.taken_at) && (
+{(() => {
+                 const isVideo = light.media_type === 2;
+                 const src = light.local_path
+                   ? convertFileSrc(light.local_path)
+                   : (light.best_url ?? light.thumbnail_url) ?? "";
+                 return isVideo ? (
+                   <video
+                     key={src}
+                     src={src}
+                     controls
+                     autoPlay
+                     playsInline
+                     className="lightbox-video"
+                   />
+                 ) : (
+                   <img src={src} alt={light.caption ?? light.media_id} />
+                 );
+               })()}
+<div className="lightbox-actions">
+                  {light.status === "downloaded" ? (
+                    <span className="dl-chip ok">
+                      <CheckCircle2 size={13} /> Descargado
+                    </span>
+                  ) : (
+                    <button
+                      className="btn primary sm"
+                      disabled={dlOne != null || !light.best_url}
+                      onClick={() => doDownloadOne(light)}
+                    >
+                      {dlOne === light.id ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <Download size={14} />
+                      )}
+                      {light.status === "failed" ? "Reintentar" : "Descargar"}
+                    </button>
+                  )}
+                  {light.status === "downloaded" && light.local_path && (
+                    <button
+                      className="btn ghost sm"
+                      disabled={saving}
+                      onClick={() =>
+                        saveToPC(
+                          light.local_path,
+                          (light.local_path ?? "").split(/[\\/]/).pop() || "archivo",
+                        )
+                      }
+                      title="Copiar este archivo a una carpeta de tu equipo"
+                    >
+                      {saving ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <FolderDown size={14} />
+                      )}
+                      Guardar en este equipo
+                    </button>
+                  )}
+                  {light.status === "downloaded" && (
+                    <button
+                      className="btn ghost sm"
+                      disabled={reDl != null}
+                      onClick={() => doRedownload(light)}
+                      title="Borrar este archivo y descargarlo de nuevo (máxima calidad)"
+                    >
+                      {reDl === light.id ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <RotateCcw size={14} />
+                      )}
+                      Re-descargar
+                    </button>
+                  )}
+                  {light.status === "failed" && light.error && (
+                    <span className="lightbox-err" title={light.error}>
+                      <AlertTriangle size={13} /> {light.error}
+                    </span>
+                  )}
+                </div>
+               {(light.caption || light.taken_at) && (
                 <div className="lightbox-meta">
                   {light.taken_at && (
                     <span>
@@ -360,6 +698,26 @@ export function MediaDetail({
           <button className="btn ghost" onClick={() => setConfirm(false)}>Cancelar</button>
           <button className="btn danger" onClick={doDelete}>
             <Trash2 size={15} /> Eliminar
+          </button>
+        </div>
+      </Modal>
+
+      <Modal
+        open={clearConfirm}
+        onClose={() => setClearConfirm(false)}
+        title="Vaciar álbum"
+        icon={<Trash2 size={18} />}
+        width={400}
+      >
+        <p className="confirm-text">
+          ¿Borrar los <strong>{counts.album ?? 0}</strong> archivos descargados de{" "}
+          <strong>@{prof.username}</strong> en tu equipo? La base de datos se conserva:
+          después podrás volver a descargarlos.
+        </p>
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={() => setClearConfirm(false)}>Cancelar</button>
+          <button className="btn danger" onClick={doClear} disabled={clearing}>
+            <Trash2 size={15} /> Vaciar álbum
           </button>
         </div>
       </Modal>

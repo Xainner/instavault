@@ -1,5 +1,5 @@
 mod commands;
-mod creds;
+pub mod creds;
 mod db;
 pub mod instagram;
 
@@ -21,6 +21,7 @@ pub struct AppState {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let dl_dir = data_dir.join("downloads");
@@ -56,7 +57,16 @@ pub fn run() {
                     commands::sync_posts,
                     commands::sync_stories,
                     commands::sync_highlights,
-                    commands::download_profile,
+commands::download_profile,
+                     commands::download_media,
+                     commands::reset_download,
+                     commands::clear_downloads,
+commands::set_profile_favorite,
+                     commands::download_avatar,
+                     commands::get_profile_stats,
+commands::list_download_jobs,
+                     commands::clear_finished_jobs,
+                     commands::copy_file_to,
                 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

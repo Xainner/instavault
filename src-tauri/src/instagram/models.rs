@@ -12,9 +12,16 @@ pub struct ProfileRow {
     pub followers: Option<i64>,
     pub following: Option<i64>,
     pub media_count: Option<i64>,
-    pub is_private: i64,
-    pub is_verified: i64,
+    // Option: una fetch degradada devuelve null y el upsert con COALESCE
+    // conserva el valor real guardado.
+    pub is_private: Option<i64>,
+    pub is_verified: Option<i64>,
     pub profile_pic_url: Option<String>,
+    /// Copia local de la foto (%APPDATA%/avatars/{id}.jpg). El WebView no
+    /// siempre puede cargar la CDN (URLs firmadas que expiran), así que la
+    /// app la descarga una vez en Rust y la sirve por asset-protocol.
+    pub avatar_local_path: Option<String>,
+    pub is_favorite: i64,
     pub fetched_at: Option<i64>,
     pub id: Option<i64>,
 }
@@ -60,19 +67,23 @@ pub struct WebProfileData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebProfileUser {
-    pub id: String,
+    // Option: el fallback HTML devuelve null cuando no logra extraer el id.
+    #[serde(default)]
+    pub id: Option<String>,
     pub username: String,
     pub full_name: Option<String>,
     pub biography: Option<String>,
     pub profile_pic_url_hd: Option<String>,
     pub is_private: Option<bool>,
     pub is_verified: Option<bool>,
+    // Option: el fallback HTML devuelve null (dato desconocido) y el upsert
+    // con COALESCE no pisa los valores reales guardados.
     #[serde(default)]
-    pub edge_followed_by: CountWrap,
+    pub edge_followed_by: Option<CountWrap>,
     #[serde(default)]
-    pub edge_follow: CountWrap,
+    pub edge_follow: Option<CountWrap>,
     #[serde(default)]
-    pub edge_owner_to_timeline_media: CountWrap,
+    pub edge_owner_to_timeline_media: Option<CountWrap>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -175,6 +186,15 @@ pub struct HighlightTrayItem {
     pub title: Option<String>,
 }
 
+/// Highlight reel extraído del DOM de la página de perfil (el endpoint
+/// mobile `highlights_tray` devuelve `status: fail`; la web los renderiza igual).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HighlightReel {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+}
+
 // Reels_media → dict keyed por reel id
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReelsMediaResponse {
@@ -192,4 +212,68 @@ pub struct ExtractedMedia {
     pub media_type: i64,
     pub thumbnail_url: Option<String>,
     pub best_url: String,
+}
+
+// ---- DTOs de descargas y estado (frontend) ----
+
+/// Snapshot de progreso emitido vía evento `download:progress`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadProgress {
+    pub job_id: i64,
+    pub profile_id: i64,
+    pub kind: String,
+    pub total: usize,
+    pub done: usize,
+    pub ok: usize,
+    pub failed: usize,
+    /// code (o media_id) del ítem recién procesado.
+    pub current: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadError {
+    pub media_id: String,
+    pub code: Option<String>,
+    pub error: String,
+}
+
+/// Resultado autoritativo de un lote (retorna el comando; los eventos son informativos).
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadSummary {
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub errors: Vec<DownloadError>,
+}
+
+/// Job de descarga persistido (manager de descargas).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadJob {
+    pub id: i64,
+    pub profile_id: i64,
+    pub username: String,
+    pub kind: String,
+    pub total: i64,
+    pub ok: i64,
+    pub failed: i64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+/// Estado de sincronización/descarga de un kind (agregado desde `media`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KindStats {
+    pub kind: String,
+    pub local_count: i64,
+    pub downloaded: i64,
+    pub failed: i64,
+    pub last_sync: Option<i64>,
+}
+
+/// Stats de un perfil (1 consulta para toda la UI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileStats {
+    pub profile_id: i64,
+    pub total_media: i64,
+    pub kinds: Vec<KindStats>,
 }

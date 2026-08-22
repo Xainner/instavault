@@ -1,118 +1,151 @@
 <p align="center">
-  <img src="logo.png" alt="InstaVault" width="180" />
+  <img src="logo.png" alt="InstaVault" width="160" />
 </p>
 
 <h1 align="center">InstaVault</h1>
 
 <p align="center">
-  <strong>Descargador de perfiles de Instagram</strong> — fotos de perfil, publicaciones, stories y highlights, guardados en base de datos local.
+  <strong>Archivador local de perfiles de Instagram.</strong><br/>
+  Publicaciones, stories, highlights y fotos de perfil — descargados en máxima calidad<br/>y organizados en una biblioteca SQLite con deduplicación.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Tauri-2.0-24C8D8?logo=tauri&logoColor=white" alt="Tauri">
-  <img src="https://img.shields.io/badge/Rust-1.95-dea584?logo=rust&logoColor=white" alt="Rust">
-  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
-  <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white" alt="SQLite">
-  <img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia">
+  <img src="https://img.shields.io/badge/Tauri-2-24C8D8?logo=tauri&logoColor=white" alt="Tauri"/>
+  <img src="https://img.shields.io/badge/Rust-estable-DEA584?logo=rust&logoColor=white" alt="Rust"/>
+  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React"/>
+  <img src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white" alt="TypeScript"/>
+  <img src="https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white" alt="SQLite"/>
+  <img src="https://img.shields.io/badge/plataforma-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Plataformas"/>
+  <img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia"/>
 </p>
 
 ---
 
-## Descripción
+## ✨ Características
 
-InstaVault es una aplicación de escritorio que permite **archivar contenido de perfiles de Instagram** de forma local. Gestiona múltiples cuentas mediante cookies (necesarias para perfiles privados y stories), descarga los medios en máxima calidad y los organiza automáticamente, manteniendo un registro en SQLite con deduplicación por ID de contenido.
+### Cuentas y sesiones
+- **Tres formas de entrar**: pegar las cookies de tu navegador, **importar desde un perfil de Chrome/Edge/Firefox** (cookies descriptas del keyring del sistema), o **login asistido** en el navegador propio de la app (Chrome headless con CDP).
+- **Cifrado en el keyring del sistema**: las cookies nunca se guardan en claro, ni siquiera en la base de datos.
+- **Validación de sesión** continua (reintenta y detecta expiración), con múltiples cuentas a la vez.
 
-## Características
+### Perfiles
+- Búsqueda por username mediante un **motor CDP** (Instagram bloquea los clientes HTTP externos; la app navega con un Chrome propio).
+- Datos completos: nombre, bio, seguidores, seguidos, privacidad, foto de perfil en HD (descargada y guardada localmente).
+- **Favoritos** y estadísticas por perfil y por tipo de contenido.
 
-- **Gestión de cuentas por cookies**: agrega tu sesión (sessionid, csrftoken, ds_user_id) pegada desde el navegador; se valida y se guarda cifrada en el llavero del sistema (keyring), nunca en claro.
-- **Perfiles**: resolución por username, foto de perfil en HD, datos (bio, seguidores, seguidos, privacidad).
-- **Contenido descargable**:
-  - Publicaciones del feed (incluye carruseles y videos, con paginación).
-  - Stories activas.
-  - Highlights.
-- **Persistencia en SQLite**: perfiles, medios, highlights y estado de cada descarga.
-- **Descarga robusta**: mejor resolución disponible, reintentos con backoff, descarga concurrente y **deduplicación por media_id** (no vuelve a bajar lo ya guardado).
-- **Interfaz en español** con tema oscuro: dashboard de cuentas, biblioteca de perfiles y explorador de medios.
+### Contenido
+- **Posts**: feed con paginación, carruseles (item por item) y videos.
+- **Stories** activas.
+- **Highlights**: lectura del DOM del perfil + API de reels (los endpoints públicos de highlights están caídos; la app los extrae del navegador).
+- **Auto-sync**: al abrir un perfil recién buscado, la app trae posts, stories y highlights automáticamente (solo metadatos).
 
-## Stack
+### Descargas
+- **Máxima calidad disponible**: al descargar, la app consulta `media/{id}/info/` y toma el mejor candidato — para stories/highlights es la **resolución original sin límite de píxeles** — y con firma de CDN fresca (adiós 403 por URL expirada).
+- **Download manager**: concurrencia configurable, progreso por ítem, reintentos con backoff y panel de jobs.
+- **Deduplicación por `media_id`**: nunca re-baja lo que ya está en disco.
+- **Re-descargar** cualquier ítem (borra el archivo y lo baja de nuevo) y **vaciar el álbum** por perfil.
+- **Álbum por perfil**: grilla de lo descargado con lightbox, y **“Guardar en este equipo”** para copiar cualquier archivo (o la foto de perfil) a donde quieras.
 
-| Componente | Tecnología |
-|---|---|
-| Shell de escritorio | [Tauri 2](https://tauri.app) |
-| Backend (scraping, BD, descargas) | Rust (`reqwest`, `rusqlite`, `keyring`, `tokio`) |
-| Frontend | React + TypeScript + Vite |
-| Base de datos | SQLite |
-| Almacenamiento de credenciales | Keyring del sistema operativo |
+### Biblioteca local
+- SQLite (modo WAL): perfiles, medios, highlights, jobs y estado de cada descarga, con reintentos de fallidos.
+- Interfaz en español, tema oscuro, animaciones con Framer Motion.
 
-## Requisitos
+---
 
+## 🚀 Instalación
+
+### Requisitos
 - [Rust](https://rustup.rs) (toolchain estable)
-- [Node.js](https://nodejs.org) 18+
-- Windows / macOS / Linux (probado en Windows)
-
-## Instalación y uso
+- [Node.js](https://nodejs.org) 18+ (probado con 24)
+- Windows, macOS o Linux (desarrollado y probado en Windows)
 
 ```bash
-# Instalar dependencias del frontend
+# Clonar
+git clone https://github.com/Xainner/instavault.git
+cd instavault
+
+# Dependencias
 npm install
 
-# Aprobar el postinstall de esbuild (npm 12)
-npm install-scripts approve esbuild
-
-# Ejecutar en modo desarrollo
+# Desarrollo (hot-reload)
 npm run tauri dev
 
-# Compilar instalador
+# Build de producción (instalador MSI + NSIS en Windows)
 npm run tauri build
 ```
 
+> El binario final queda en `src-tauri/target/release/instavault.exe` y los bundles en `src-tauri/target/release/bundle/`.
+
 ### Primeros pasos
+1. **Cuentas** → agregá tu sesión (pegando cookies o importando desde tu navegador; también hay login asistido con el navegador de la app).
+2. **Perfiles** → buscá un username. El primer sync es automático; desde el detalle podés sincronizar por tipo (posts / stories / highlights).
+3. **Descargar pendientes** → los archivos van a `%APPDATA%/com.xainner.instavault/downloads/<username>/<tipo>/` (en macOS/Linux: `~/Library/Application Support/…` / `~/.local/share/…`).
+4. **Álbum** → mirá lo descargado, copialo a tu equipo o re-descargalo en máxima calidad.
 
-1. Abre la pestaña **Cuentas** y agrega la tuya pegando las cookies de una sesión iniciada en Instagram (`sessionid`, `csrftoken`, `ds_user_id`).
-2. Ve a la pestaña **Perfiles**, busca un username y guárdalo.
-3. En la tarjeta del perfil, usa **⟳** para sincronizar (posts, stories o highlights) y **⬇** para descargarlos.
-4. Explora el contenido descargado en la vista de detalle.
+---
 
-## Arquitectura
+## 🏗️ Arquitectura
 
 ```
 src-tauri/
 ├── src/
-│   ├── lib.rs             # Arranque, estado global y registro de comandos
-│   ├── commands.rs        # Comandos IPC (tauri::command) expuestos al frontend
-│   ├── creds.rs           # Guardado/lectura de cookies en el keyring
-│   ├── db.rs              # Capa SQLite (esquema + CRUD, con tests)
+│   ├── lib.rs               # Arranque, plugins (dialog/opener) y registro de comandos
+│   ├── commands.rs          # Comandos IPC expuestos al frontend
+│   ├── creds.rs             # Cookies cifradas en el keyring del sistema
+│   ├── db.rs                # Capa SQLite: esquema, CRUD, jobs y stats (con tests)
 │   └── instagram/
-│       ├── client.rs      # Cliente HTTP con headers y sesión
-│       ├── api.rs         # Endpoints de la API privada de Instagram
-│       ├── models.rs      # Estructuras de deserialización y modelos de BD
-│       └── download.rs    # Pipeline de descarga con dedup y reintentos
+│       ├── client.rs        # Cliente HTTP mobile (UA, headers, sesión)
+│       ├── api.rs           # Endpoints privados: feed, reels, media/info
+│       ├── models.rs        # DTOs de la API + modelos de BD
+│       ├── cdp_login.rs     # Motor CDP: Chrome propio, login asistido, navegación,
+│       │                    #   fetch vía página y extracción de highlights del DOM
+│       ├── browser.rs       # Detección y lectura de perfiles/cookies de navegadores
+│       └── download.rs      # Pipeline: concurrencia, reintentos, dedup, progreso
 src/
-├── App.tsx                # UI principal (React)
-├── lib/api.ts             # Wrapper tipado del IPC
-└── types.ts               # Tipos compartidos
+├── App.tsx                  # Shell: vistas, stats, backfill de avatars
+├── components/
+│   ├── Sidebar.tsx          # Navegación, logo y badge de descargas activas
+│   ├── AccountsView.tsx     # Cuentas: agregar/validar/importar/login asistido
+│   ├── ProfilesView.tsx     # Biblioteca de perfiles, búsqueda y favoritos
+│   ├── MediaDetail.tsx      # Explorador: pestañas, grilla, lightbox, álbum
+│   ├── Downloads.tsx        # Download manager (jobs, progreso, provider global)
+│   ├── Toasts.tsx           # Notificaciones no intrusivas
+│   └── Modal.tsx            # Diálogos de confirmación
+├── lib/api.ts               # Wrapper tipado del IPC (invoke)
+└── types.ts                 # Tipos compartidos frontend ↔ backend
 ```
 
-## Aviso legal
+### Notas de ingeniería
+- **CDP (Chrome DevTools Protocol)**: la app levanta un Chrome headless con perfil propio. Instagram bloquea (429) a los clientes HTTP externos para varias rutas, así que búsqueda de perfiles, validación de sesión y highlights pasan por el navegador: `Page.navigate` + `Runtime.evaluate` con timeouts estrictos.
+- **Calidad de imagen**: los candidatos mobile traen `stp=…e35…` (re-encode CDN) y, para stories, límite de píxeles. La firma `oh/oe` cubre el query completo (no se puede editar el `stp`), por eso la calidad máxima se obtiene consultando `media/{id}/info/` en cada descarga: devuelve candidatos frescos y, para stories/highlights, el tamaño original.
+- **Avatares**: el CDN de fotos de perfil tiene issues DNS (AAAA blackhole) en algunos entornos; la descarga de avatar fuerza IPv4 y el resultado se sirve vía asset protocol de Tauri.
+- **Datos**: `%APPDATA%/com.xainner.instavault/` → `instakeeper.db` (WAL), `downloads/`, `avatars/`.
 
-InstaVault se desarrolla con fines **personales y educativos** de archivo de contenido al que ya tienes acceso. La descarga automatizada de contenido puede violar los [Términos de uso de Instagram](https://help.instagram.com/581066165581870) y la propiedad intelectual de los creadores. Usa esta herramienta bajo tu propia responsabilidad, solo con cuentas propias y respetando los derechos de autor.
+---
 
-## Roadmap
+## 🗺️ Roadmap
 
-- [x] Cuentas por cookies y validación de sesión
-- [x] Perfiles y foto de perfil en HD
-- [x] Posts (con carruseles/videos), stories y highlights
-- [x] Persistencia SQLite con deduplicación
-- [x] Descarga en máxima calidad con reintentos
+- [x] Cuentas por cookies, importación de navegador y login asistido
+- [x] Perfiles con búsqueda CDP, favoritos y stats
+- [x] Posts (carruseles/videos), stories y highlights
+- [x] Persistencia SQLite con deduplicación y reintentos
+- [x] Download manager con progreso y jobs
+- [x] Calidad máxima (original en stories/highlights) + firmas frescas
+- [x] Álbum por perfil, re-descarga y “Guardar en este equipo”
 - [ ] Rotación entre cuentas para evitar rate-limit
-- [ ] Descarga de publicaciones guardadas y etiquetadas
-- [ ] Exportación/búsqueda de la biblioteca local
+- [ ] Exportación/búsqueda avanzada de la biblioteca local
+- [ ] Publicaciones guardadas y etiquetadas
 
-## Licencia
+## ⚖️ Aviso legal
+
+InstaVault se desarrolla con fines **personales y educativos** para archivar contenido al que ya tenés acceso. La descarga automatizada puede violar los [Términos de uso de Instagram](https://help.instagram.com/581066165581870) y los derechos de propiedad intelectual de los creadores. Usá esta herramienta bajo tu propia responsabilidad, preferentemente con tu propia cuenta y respetando a los autores.
+
+## 📄 Licencia
 
 [MIT](LICENSE)
 
 ---
 
-Hecho con Rust y Tauri.
+<p align="center">
+  Hecho con <a href="https://www.rust-lang.org">Rust</a> y <a href="https://tauri.app">Tauri</a>.
+</p>

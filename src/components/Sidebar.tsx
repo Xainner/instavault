@@ -1,6 +1,7 @@
 import { motion } from "framer-motion";
-import { KeyRound, LayoutGrid, ShieldCheck } from "lucide-react";
+import { Download, KeyRound, LayoutGrid, ShieldCheck } from "lucide-react";
 import type { AccountInfo } from "../types";
+import { useDownloads } from "./Downloads";
 
 export type View = "profiles" | "accounts";
 
@@ -12,6 +13,9 @@ export function Sidebar({
   setAccountId,
   profileCount,
   mediaCount,
+  dlOpen,
+  onOpenDownloads,
+  downloadedCount,
 }: {
   view: View;
   setView: (v: View) => void;
@@ -20,7 +24,11 @@ export function Sidebar({
   setAccountId: (id: number) => void;
   profileCount: number;
   mediaCount: number;
+  dlOpen: boolean;
+  onOpenDownloads: () => void;
+  downloadedCount: number;
 }) {
+  const dl = useDownloads();
   const items: { id: View; label: string; icon: React.ReactNode; badge: number }[] = [
     { id: "profiles", label: "Perfiles", icon: <LayoutGrid size={18} />, badge: profileCount },
     { id: "accounts", label: "Cuentas", icon: <KeyRound size={18} />, badge: accounts.length },
@@ -30,13 +38,7 @@ export function Sidebar({
     <aside className="sidebar">
       {/* Logo */}
       <div className="side-logo">
-        <div className="logo-badge">
-          <img src="/icon.png" alt="" />
-        </div>
-        <div className="logo-text">
-          <span className="logo-name">InstaVault</span>
-          <span className="logo-sub">Instagram Archive</span>
-        </div>
+        <img src="/logo.png" alt="InstaVault" />
       </div>
 
       {/* Navegación */}
@@ -60,6 +62,27 @@ export function Sidebar({
             <span className="nav-badge">{it.badge}</span>
           </button>
         ))}
+
+        <div className="side-label">Archivo</div>
+        <button
+          className={`nav-item ${dlOpen ? "active" : ""}`}
+          onClick={onOpenDownloads}
+        >
+          {dlOpen && (
+            <motion.span
+              layoutId="nav-pill"
+              className="nav-pill"
+              transition={{ type: "spring", stiffness: 400, damping: 32 }}
+            />
+          )}
+          <span className="nav-icon">
+            <Download size={18} />
+          </span>
+          Descargas
+          <span className={`nav-badge ${dl.active > 0 ? "live" : ""}`}>
+            {dl.active > 0 ? dl.active : downloadedCount}
+          </span>
+        </button>
       </nav>
 
       {/* Cuenta activa */}

@@ -1,42 +1,35 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Sidebar, type View } from "./components/Sidebar";
 import { AccountsView } from "./components/AccountsView";
 import { ProfilesView } from "./components/ProfilesView";
 import { MediaDetail } from "./components/MediaDetail";
+import { DownloadManager, DownloadProvider } from "./components/Downloads";
 import { ToastProvider } from "./components/Toasts";
-import {
-  getMedia,
-  listAccounts,
-  listProfiles,
-} from "./lib/api";
-import type { AccountInfo, Kind, Profile } from "./types";
+import { downloadAvatar, getProfileStats, listAccounts, listProfiles } from "./lib/api";
+import type { AccountInfo, Kind, Profile, ProfileStats } from "./types";
 import "./App.css";
 
 function Shell() {
   const [view, setView] = useState<View>("profiles");
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [stats, setStats] = useState<ProfileStats[]>([]);
   const [accountId, setAccountId] = useState<number>(0);
   const [detail, setDetail] = useState<{ prof: Profile; kind: Kind } | null>(null);
-  const [mediaTotal, setMediaTotal] = useState(0);
+  const [dlOpen, setDlOpen] = useState(false);
   const [firstLoad, setFirstLoad] = useState(true);
 
   const load = useCallback(async () => {
-    const [accs, profs] = await Promise.all([listAccounts(), listProfiles()]);
+    const [accs, profs, st] = await Promise.all([
+      listAccounts(),
+      listProfiles(),
+      getProfileStats().catch(() => [] as ProfileStats[]),
+    ]);
     setAccounts(accs);
     setProfiles(profs);
+    setStats(st);
     if (!accountId && accs[0]) setAccountId(accs[0].id);
-    // conteo total de medios (para el pie de la sidebar)
-    try {
-      const withId = profs.filter((p) => p.id != null);
-      const totals = await Promise.all(
-        withId.map((p) => getMedia(p.id!).then((m) => m.length).catch(() => 0)),
-      );
-      setMediaTotal(totals.reduce((a, b) => a + b, 0));
-    } catch {
-      /* noop */
-    }
     setFirstLoad(false);
   }, [accountId]);
 
@@ -45,9 +38,37 @@ function Shell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Localiza la foto de perfil: el WebView no carga bien la CDN (URLs firmadas
+  // que expiran + IPv6 caído), así que se descarga una vez en Rust y se sirve
+  // vía asset-protocol. Disparo en background por perfil sin copia local.
+  const avatarBusy = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    for (const p of profiles) {
+      if (!p.id || !p.profile_pic_url || p.avatar_local_path) continue;
+      const id = p.id;
+      if (avatarBusy.current.has(id)) continue;
+      avatarBusy.current.add(id);
+      downloadAvatar(id)
+        .then((path) => {
+          if (!path) return;
+          setProfiles((prev) =>
+            prev.map((q) => (q.id === id ? { ...q, avatar_local_path: path } : q)),
+          );
+        })
+        .catch(() => {})
+        .finally(() => avatarBusy.current.delete(id));
+    }
+  }, [profiles]);
+
   const onChanged = useCallback(() => {
     load();
   }, [load]);
+
+  const mediaTotal = stats.reduce((a, s) => a + s.total_media, 0);
+  const downloadedTotal = stats.reduce(
+    (a, s) => a + s.kinds.reduce((x, k) => x + k.downloaded, 0),
+    0,
+  );
 
   const body = useMemo(() => {
       if (firstLoad)
@@ -63,6 +84,7 @@ function Shell() {
     }, [firstLoad]);
 
   return (
+    <DownloadProvider onJobDone={onChanged}>
     <div className="layout">
       <Sidebar
         view={view}
@@ -75,6 +97,9 @@ function Shell() {
         setAccountId={setAccountId}
         profileCount={profiles.length}
         mediaCount={mediaTotal}
+        downloadedCount={downloadedTotal}
+        dlOpen={dlOpen}
+        onOpenDownloads={() => setDlOpen((o) => !o)}
       />
 
       <main className="main">
@@ -88,9 +113,10 @@ function Shell() {
               transition={{ duration: 0.2 }}
             >
               <MediaDetail
-                prof={detail.prof}
+                prof={profiles.find((q) => q.id === detail.prof.id) ?? detail.prof}
                 kind={detail.kind}
                 accountId={accountId}
+                stats={stats.find((s) => s.profile_id === detail.prof.id) ?? null}
                 onBack={() => setDetail(null)}
                 onChanged={onChanged}
               />
@@ -115,6 +141,7 @@ function Shell() {
                 <ProfilesView
                   profiles={profiles}
                   accountId={accountId}
+                  stats={stats}
                   onOpen={(p) => setDetail({ prof: p, kind: "post" })}
                   onChanged={onChanged}
                 />
@@ -123,7 +150,14 @@ function Shell() {
           )}
         </AnimatePresence>
       </main>
+
+      <DownloadManager
+        open={dlOpen}
+        onClose={() => setDlOpen(false)}
+        accountId={accountId}
+      />
     </div>
+    </DownloadProvider>
   );
 }
 

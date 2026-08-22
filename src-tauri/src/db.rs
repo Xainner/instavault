@@ -40,6 +40,7 @@ impl Db {
                 is_private      INTEGER,
                 is_verified     INTEGER,
                 profile_pic_url TEXT,
+                is_favorite     INTEGER NOT NULL DEFAULT 0,
                 fetched_at      INTEGER
             );
 
@@ -67,9 +68,59 @@ impl Db {
                 profile_id   INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
                 fetched_at   INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS sync_stats (
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                kind       TEXT NOT NULL,
+                last_sync  INTEGER,
+                PRIMARY KEY (profile_id, kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS download_jobs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id  INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                kind        TEXT NOT NULL,
+                total       INTEGER NOT NULL,
+                ok          INTEGER NOT NULL DEFAULT 0,
+                failed      INTEGER NOT NULL DEFAULT 0,
+                started_at  INTEGER NOT NULL,
+                finished_at INTEGER
+            );
             "#,
         )?;
+        // Migration para BDs existentes (idempotente): la columna is_favorite
+        // no existía en el CREATE original.
+        if !Self::column_exists(&self.conn, "profiles", "is_favorite") {
+            self.conn.execute(
+                "ALTER TABLE profiles ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // Copia local de la foto de perfil (servida vía asset-protocol).
+        if !Self::column_exists(&self.conn, "profiles", "avatar_local_path") {
+            self.conn
+                .execute("ALTER TABLE profiles ADD COLUMN avatar_local_path TEXT", [])?;
+        }
+        // Jobs "en curso" de una sesión anterior: la app murió a mitad de
+        // descarga, así que se cierran con lo que alcanzó.
+        self.conn.execute(
+            "UPDATE download_jobs SET finished_at=?1 WHERE finished_at IS NULL",
+            [chrono::Utc::now().timestamp()],
+        )?;
         Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
+        // Nombres hardcodeados (sin inyección): solo se consulta la pragma.
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+            ),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
     }
 
     // ---- Accounts ----
@@ -127,20 +178,29 @@ impl Db {
         &self,
         p: &crate::instagram::models::ProfileRow,
     ) -> rusqlite::Result<i64> {
+// COALESCE: una fetch degradada (fallback HTML con nulls) no pisa los
+        // valores reales guardados. is_favorite nunca se toca (sobrevive re-fetches).
         self.conn.execute(
             r#"INSERT INTO profiles (username, pk, full_name, biography, followers, following,
-                                     media_count, is_private, is_verified, profile_pic_url, fetched_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-               ON CONFLICT(username) DO UPDATE SET
-                 pk=excluded.pk, full_name=excluded.full_name, biography=excluded.biography,
-                 followers=excluded.followers, following=excluded.following,
-                 media_count=excluded.media_count, is_private=excluded.is_private,
-                 is_verified=excluded.is_verified, profile_pic_url=excluded.profile_pic_url,
-                 fetched_at=excluded.fetched_at"#,
+                                      media_count, is_private, is_verified, profile_pic_url,
+                                      avatar_local_path, fetched_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                ON CONFLICT(username) DO UPDATE SET
+                  pk=COALESCE(excluded.pk, profiles.pk),
+                  full_name=COALESCE(excluded.full_name, profiles.full_name),
+                  biography=COALESCE(excluded.biography, profiles.biography),
+                  followers=COALESCE(excluded.followers, profiles.followers),
+                  following=COALESCE(excluded.following, profiles.following),
+                  media_count=COALESCE(excluded.media_count, profiles.media_count),
+                  is_private=COALESCE(excluded.is_private, profiles.is_private),
+                  is_verified=COALESCE(excluded.is_verified, profiles.is_verified),
+                  profile_pic_url=COALESCE(excluded.profile_pic_url, profiles.profile_pic_url),
+                  avatar_local_path=COALESCE(excluded.avatar_local_path, profiles.avatar_local_path),
+                  fetched_at=excluded.fetched_at"#,
             params![
                 p.username, p.pk, p.full_name, p.biography, p.followers, p.following,
                 p.media_count, p.is_private, p.is_verified, p.profile_pic_url,
-                p.fetched_at
+                p.avatar_local_path, p.fetched_at
             ],
         )?;
         Ok(self.conn.query_row(
@@ -164,10 +224,11 @@ impl Db {
     ) -> rusqlite::Result<Option<crate::instagram::models::ProfileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT username, pk, full_name, biography, followers, following, media_count,
-                    is_private, is_verified, profile_pic_url, fetched_at, id
+                    is_private, is_verified, profile_pic_url, avatar_local_path,
+                    is_favorite, fetched_at, id
              FROM profiles WHERE id=?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |r| {
+        let rows = stmt.query_map(params![id], |r| {
             Ok(crate::instagram::models::ProfileRow {
                 username: r.get(0)?,
                 pk: r.get(1)?,
@@ -176,21 +237,25 @@ impl Db {
                 followers: r.get(4)?,
                 following: r.get(5)?,
                 media_count: r.get(6)?,
-                is_private: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                is_verified: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                is_private: r.get(7)?,
+                is_verified: r.get(8)?,
                 profile_pic_url: r.get(9)?,
-                fetched_at: r.get(10)?,
-                id: Some(r.get(11)?),
+                avatar_local_path: r.get(10)?,
+                is_favorite: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                fetched_at: r.get(12)?,
+                id: Some(r.get(13)?),
             })
-        })?;
-        Ok(rows.next().transpose()?)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().next())
     }
 
     pub fn list_profiles(&self) -> rusqlite::Result<Vec<crate::instagram::models::ProfileRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT username, pk, full_name, biography, followers, following, media_count,
-                    is_private, is_verified, profile_pic_url, fetched_at, id
-             FROM profiles ORDER BY username",
+"SELECT username, pk, full_name, biography, followers, following, media_count,
+                    is_private, is_verified, profile_pic_url, avatar_local_path,
+                    is_favorite, fetched_at, id
+             FROM profiles ORDER BY is_favorite DESC, username",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -202,11 +267,13 @@ impl Db {
                     followers: r.get(4)?,
                     following: r.get(5)?,
                     media_count: r.get(6)?,
-                    is_private: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    is_verified: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    is_private: r.get(7)?,
+                    is_verified: r.get(8)?,
                     profile_pic_url: r.get(9)?,
-                    fetched_at: r.get(10)?,
-                    id: Some(r.get(11)?),
+                    avatar_local_path: r.get(10)?,
+                    is_favorite: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    fetched_at: r.get(12)?,
+                    id: Some(r.get(13)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -260,6 +327,37 @@ impl Db {
             params![id, error],
         )?;
         Ok(())
+    }
+
+    /// Vuelve un medio descargado a pendiente (permite re-descargarlo).
+    pub fn reset_download(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE media SET status='metadata', local_path=NULL, error=NULL WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Vuelve a pendiente todos los descargados de un perfil (o un kind).
+    pub fn reset_downloads_profile(
+        &self,
+        profile_id: i64,
+        kind: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        let n = if let Some(k) = kind {
+            self.conn.execute(
+                "UPDATE media SET status='metadata', local_path=NULL, error=NULL
+                 WHERE profile_id=?1 AND kind=?2 AND status='downloaded'",
+                params![profile_id, k],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE media SET status='metadata', local_path=NULL, error=NULL
+                 WHERE profile_id=?1 AND status='downloaded'",
+                params![profile_id],
+            )?
+        };
+        Ok(n)
     }
 
     pub fn media_by_profile(
@@ -366,6 +464,232 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ---- Favoritos ----
+    pub fn set_favorite(&self, profile_id: i64, favorite: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE profiles SET is_favorite=?2 WHERE id=?1",
+            params![profile_id, favorite as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Guarda la ruta local de la foto de perfil ya descargada.
+    pub fn set_avatar_path(&self, profile_id: i64, path: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE profiles SET avatar_local_path=?2 WHERE id=?1", params![profile_id, path])?;
+        Ok(())
+    }
+
+    // ---- Estado de sincronización ----
+
+    /// Registra que se sincronizó un kind (última vez; idempotente por profile+kind).
+    pub fn record_sync(&self, profile_id: i64, kind: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_stats (profile_id, kind, last_sync) VALUES (?1,?2,?3)
+             ON CONFLICT(profile_id, kind) DO UPDATE SET last_sync=excluded.last_sync",
+            params![profile_id, kind, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Re-sincronizar reintenta: failed → metadata (limpia el error).
+    pub fn reset_failed(&self, profile_id: i64, kind: &str) -> rusqlite::Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE media SET status='metadata', error=NULL
+             WHERE profile_id=?1 AND kind=?2 AND status='failed'",
+            params![profile_id, kind],
+        )?;
+        Ok(n)
+    }
+
+    /// Stats por perfil: conteos siempre agregados desde `media` (fuente de verdad)
+    /// + last_sync de `sync_stats`.
+    pub fn profile_stats(&self) -> rusqlite::Result<Vec<crate::instagram::models::ProfileStats>> {
+        use crate::instagram::models::{KindStats, ProfileStats};
+        let mut by_profile: std::collections::HashMap<
+            i64,
+            (i64, std::collections::HashMap<String, KindStats>),
+        > = std::collections::HashMap::new();
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT profile_id, COUNT(*) FROM media GROUP BY profile_id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (pid, total) in rows {
+                by_profile.insert(pid, (total, std::collections::HashMap::new()));
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT profile_id, kind, COUNT(*),
+                        COALESCE(SUM(status='downloaded'),0), COALESCE(SUM(status='failed'),0)
+                 FROM media GROUP BY profile_id, kind",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (pid, kind, local, downloaded, failed) in rows {
+                if let Some(entry) = by_profile.get_mut(&pid) {
+                    entry.1.insert(
+                        kind.clone(),
+                        KindStats {
+                            kind,
+                            local_count: local,
+                            downloaded,
+                            failed,
+                            last_sync: None,
+                        },
+                    );
+                }
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT profile_id, kind, last_sync FROM sync_stats",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (pid, kind, last_sync) in rows {
+                if let Some(entry) = by_profile.get_mut(&pid) {
+                    if let Some(k) = entry.1.get_mut(&kind) {
+                        k.last_sync = last_sync;
+                    } else {
+                        entry.1.insert(
+                            kind.clone(),
+                            KindStats {
+                                kind,
+                                local_count: 0,
+                                downloaded: 0,
+                                failed: 0,
+                                last_sync,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+let mut out = Vec::with_capacity(by_profile.len());
+        for (pid, (total, kinds)) in by_profile {
+            out.push(ProfileStats {
+                profile_id: pid,
+                total_media: total,
+                kinds: kinds.into_values().collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    // ---- Descarga (por medio) ----
+    pub fn get_media_by_id(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<Option<crate::instagram::models::MediaRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT media_id, profile_id, kind, code, taken_at, caption, media_type,
+                    thumbnail_url, best_url, local_path, status, error, created_at, id
+             FROM media WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |r| {
+            Ok(crate::instagram::models::MediaRow {
+                media_id: r.get(0)?,
+                profile_id: r.get(1)?,
+                kind: r.get(2)?,
+                code: r.get(3)?,
+                taken_at: r.get(4)?,
+                caption: r.get(5)?,
+                media_type: r.get(6)?,
+                thumbnail_url: r.get(7)?,
+                best_url: r.get(8)?,
+                local_path: r.get(9)?,
+                status: r.get(10)?,
+                error: r.get(11)?,
+                created_at: r.get(12)?,
+                id: Some(r.get(13)?),
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    // ---- Jobs de descarga (manager) ----
+    pub fn insert_job(&self, profile_id: i64, kind: &str, total: i64) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO download_jobs (profile_id, kind, total, started_at)
+             VALUES (?1,?2,?3,?4)",
+            params![profile_id, kind, total, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn finish_job(&self, job_id: i64, ok: i64, failed: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE download_jobs SET ok=?2, failed=?3, finished_at=?4 WHERE id=?1",
+            params![job_id, ok, failed, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_jobs(&self, limit: i64) -> rusqlite::Result<Vec<crate::instagram::models::DownloadJob>> {
+        use crate::instagram::models::DownloadJob;
+        let mut stmt = self.conn.prepare(
+            "SELECT j.id, j.profile_id, p.username, j.kind, j.total, j.ok, j.failed,
+                    j.started_at, j.finished_at
+             FROM download_jobs j JOIN profiles p ON p.id = j.profile_id
+             ORDER BY j.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(DownloadJob {
+                    id: r.get(0)?,
+                    profile_id: r.get(1)?,
+                    username: r.get(2)?,
+                    kind: r.get(3)?,
+                    total: r.get(4)?,
+                    ok: r.get(5)?,
+                    failed: r.get(6)?,
+                    started_at: r.get(7)?,
+                    finished_at: r.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Hay un job en curso para este perfil+kind (para no lanzar dos descargas
+/// concurrentes del mismo lote: escribirían sobre los mismos archivos).
+    pub fn has_active_job(&self, profile_id: i64, kind: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.query_row(
+            "SELECT COUNT(*) FROM download_jobs WHERE profile_id=?1 AND kind=?2 AND finished_at IS NULL",
+            params![profile_id, kind],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn clear_finished_jobs(&self) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM download_jobs WHERE finished_at IS NOT NULL", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -403,9 +727,11 @@ mod tests {
             followers: Some(10),
             following: Some(20),
             media_count: Some(3),
-            is_private: 0,
-            is_verified: 0,
+            is_private: Some(0),
+            is_verified: Some(0),
             profile_pic_url: None,
+            avatar_local_path: None,
+            is_favorite: 0,
             fetched_at: Some(1),
             id: None,
         };
@@ -452,9 +778,11 @@ mod tests {
             followers: None,
             following: None,
             media_count: None,
-            is_private: 0,
-            is_verified: 0,
+            is_private: Some(0),
+            is_verified: Some(0),
             profile_pic_url: None,
+            avatar_local_path: None,
+            is_favorite: 0,
             fetched_at: None,
             id: None,
         };
@@ -480,5 +808,161 @@ mod tests {
         let med = db.media_by_profile(pid, Some("post")).unwrap();
         assert_eq!(med.len(), 1);
         assert_eq!(med[0].code.as_deref(), Some("B"));
+    }
+
+    fn mk_profile(username: &str, pic: Option<&str>) -> ProfileRow {
+        ProfileRow {
+            username: username.into(),
+            pk: Some("999".into()),
+            full_name: Some("Nombre".into()),
+            biography: Some("bio".into()),
+            followers: Some(10),
+            following: Some(5),
+            media_count: Some(7),
+            is_private: Some(1),
+            is_verified: Some(1),
+            profile_pic_url: pic.map(|s| s.to_string()),
+            avatar_local_path: None,
+            is_favorite: 0,
+            fetched_at: Some(1),
+            id: None,
+        }
+    }
+
+    #[test]
+    fn upsert_profile_keeps_old_values_on_null() {
+        let db = temp_db();
+        db.upsert_profile(&mk_profile("ana", Some("https://pic/1.jpg"))).unwrap();
+        // Fetch degradada: todo null → no pisa foto ni conteos.
+        let degraded = ProfileRow {
+            profile_pic_url: None,
+            pk: None,
+            full_name: None,
+            biography: None,
+            followers: None,
+            following: None,
+            media_count: None,
+            is_private: None,
+            is_verified: None,
+            ..mk_profile("ana", None)
+        };
+        db.upsert_profile(&degraded).unwrap();
+        let p = db.get_profile_by_id(db.get_profile_id("ana").unwrap()).unwrap().unwrap();
+        assert_eq!(p.profile_pic_url.as_deref(), Some("https://pic/1.jpg"));
+        assert_eq!(p.followers, Some(10));
+        assert_eq!(p.pk.as_deref(), Some("999"));
+        // booleanos también sobreviven a una fetch degradada (no se resetean a 0)
+        assert_eq!(p.is_private, Some(1));
+        assert_eq!(p.is_verified, Some(1));
+    }
+
+    #[test]
+    fn favorite_survives_upsert_and_toggles() {
+        let db = temp_db();
+        let pid = db.upsert_profile(&mk_profile("ana", Some("x"))).unwrap();
+        db.set_favorite(pid, true).unwrap();
+        db.upsert_profile(&mk_profile("ana", Some("y"))).unwrap(); // re-fetch
+        let p = db.get_profile_by_id(pid).unwrap().unwrap();
+        assert_eq!(p.is_favorite, 1);
+        db.set_favorite(pid, false).unwrap();
+        let p = db.get_profile_by_id(pid).unwrap().unwrap();
+        assert_eq!(p.is_favorite, 0);
+    }
+
+    #[test]
+    fn reset_failed_only_touched_failed() {
+        let db = temp_db();
+        let pid = db.upsert_profile(&mk_profile("ana", None)).unwrap();
+        let mk = |mid: &str| MediaRow {
+            media_id: mid.into(),
+            profile_id: Some(pid),
+            kind: "post".into(),
+            code: None,
+            taken_at: None,
+            caption: None,
+            media_type: None,
+            thumbnail_url: None,
+            best_url: Some("u".into()),
+            local_path: None,
+            status: "metadata".into(),
+            error: None,
+            created_at: None,
+            id: None,
+        };
+        let a = db.upsert_media(&mk("a")).unwrap();
+        let b = db.upsert_media(&mk("b")).unwrap();
+        let c = db.upsert_media(&mk("c")).unwrap();
+        db.mark_failed(a, "HTTP 404").unwrap();
+        db.mark_downloaded(b, "/tmp/b.jpg").unwrap();
+        // c queda metadata.
+        let n = db.reset_failed(pid, "post").unwrap();
+        assert_eq!(n, 1);
+        let med = db.media_by_profile(pid, Some("post")).unwrap();
+        let by_id = |id: i64| med.iter().find(|m| m.id == Some(id)).unwrap();
+        assert_eq!(by_id(a).status, "metadata");
+        assert!(by_id(a).error.is_none());
+        assert_eq!(by_id(b).status, "downloaded"); // intacto
+        assert_eq!(by_id(c).status, "metadata");
+    }
+
+    #[test]
+    fn profile_stats_aggregates_and_sync() {
+        let db = temp_db();
+        let pid = db.upsert_profile(&mk_profile("ana", None)).unwrap();
+        let mk = |mid: &str| MediaRow {
+            media_id: mid.into(),
+            profile_id: Some(pid),
+            kind: "post".into(),
+            code: None,
+            taken_at: None,
+            caption: None,
+            media_type: None,
+            thumbnail_url: None,
+            best_url: Some("u".into()),
+            local_path: None,
+            status: "metadata".into(),
+            error: None,
+            created_at: None,
+            id: None,
+        };
+        let a = db.upsert_media(&mk("a")).unwrap();
+        let _ = db.upsert_media(&mk("b")).unwrap();
+        db.mark_downloaded(a, "/tmp/a.jpg").unwrap();
+        db.record_sync(pid, "post").unwrap();
+        db.record_sync(pid, "story").unwrap(); // sin media: aparece solo por la sync
+        let stats = db.profile_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        let s = &stats[0];
+        assert_eq!(s.profile_id, pid);
+        assert_eq!(s.total_media, 2);
+        let post = s.kinds.iter().find(|k| k.kind == "post").unwrap();
+        assert_eq!(post.local_count, 2);
+        assert_eq!(post.downloaded, 1);
+        assert!(post.last_sync.is_some());
+        let story = s.kinds.iter().find(|k| k.kind == "story").unwrap();
+        assert_eq!(story.local_count, 0);
+        assert!(story.last_sync.is_some());
+    }
+
+    #[test]
+    fn download_jobs_lifecycle() {
+        let db = temp_db();
+        let pid = db.upsert_profile(&mk_profile("ana", None)).unwrap();
+        let j1 = db.insert_job(pid, "post", 10).unwrap();
+        let j2 = db.insert_job(pid, "story", 3).unwrap();
+        db.finish_job(j1, 8, 2).unwrap();
+        let jobs = db.list_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 2);
+        let j1row = jobs.iter().find(|j| j.id == j1).unwrap();
+        assert_eq!(j1row.total, 10);
+        assert_eq!(j1row.ok, 8);
+        assert_eq!(j1row.failed, 2);
+        assert!(j1row.finished_at.is_some());
+        assert_eq!(j1row.username, "ana");
+        let j2row = jobs.iter().find(|j| j.id == j2).unwrap();
+        assert!(j2row.finished_at.is_none());
+        // cascade: borrar el perfil borra los jobs
+        db.delete_profile_cascade(pid).unwrap();
+        assert_eq!(db.list_jobs(10).unwrap().len(), 0);
     }
 }
