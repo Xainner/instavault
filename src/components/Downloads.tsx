@@ -166,7 +166,7 @@ function JobRow({
   const pct = j.total > 0 ? Math.round((j.ok / j.total) * 100) : 0;
 
   const doRetry = async () => {
-    if (retrying || !accountId) return;
+    if (retrying) return;
     setRetrying(true);
     try {
       const s = await downloadProfile(accountId, j.profile_id, j.kind as Kind, 4, true);
@@ -213,7 +213,7 @@ function JobRow({
             <button
               className="btn ghost xs"
               onClick={doRetry}
-              disabled={retrying || !accountId}
+              disabled={retrying}
             >
               {retrying ? <Loader2 size={12} className="spin" /> : <RotateCcw size={12} />}
               Reintentar {j.failed}

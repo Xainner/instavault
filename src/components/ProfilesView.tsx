@@ -374,12 +374,9 @@ export function ProfilesView({
 
   const doSearch = async (username: string) => {
     const u = username.trim().replace(/^@/, "");
-    if (!u || !accountId) {
-      toast("warning", "Sin cuenta activa", "Agrega una cuenta primero.");
-      return;
-    }
+    if (!u) return;
     setSaving(true);
-    setSearchPhase("Preparando sesión");
+    setSearchPhase("Preparando consulta pública");
     setElapsed(0);
     const started = Date.now();
     const timer = window.setInterval(() => {
@@ -437,12 +434,12 @@ export function ProfilesView({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && canRemoteSearch && accountId && !saving) {
+              if (e.key === "Enter" && canRemoteSearch && !saving) {
                 doSearch(query);
               }
             }}
           />
-          {canRemoteSearch && accountId && (
+          {canRemoteSearch && (
             <button className="btn primary sm" onClick={() => doSearch(query)} disabled={saving}>
               {saving ? <Loader2 size={14} className="spin" /> : <UserPlus size={14} />}
               Buscar

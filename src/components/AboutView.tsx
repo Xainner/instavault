@@ -7,7 +7,7 @@ import { Button } from "./ui/button";
 import { useUpdater } from "./Updater";
 
 export function AboutView({ profiles, media, downloaded }: { profiles: number; media: number; downloaded: number }) {
-  const [version, setVersion] = useState("1.0.0");
+  const [version, setVersion] = useState("1.0.1");
   const updater = useUpdater();
   useEffect(() => { void getVersion().then(setVersion); }, []);
   return <div className="view about-view">

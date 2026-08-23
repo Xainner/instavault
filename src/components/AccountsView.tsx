@@ -229,8 +229,8 @@ export function AccountsView({
         <div>
           <h1 className="page-title">Cuentas</h1>
           <p className="page-sub">
-            Gestiona las sesiones de Instagram que usa InstaVault (cookies cifradas en el llavero
-            del sistema).
+            Gestiona el acceso opcional a perfiles privados. La navegación pública nunca usa
+            estas cookies, que permanecen cifradas en el llavero del sistema.
           </p>
         </div>
         <button className="btn primary" onClick={openAdd}>
@@ -314,8 +314,8 @@ export function AccountsView({
             </div>
             <h3>Aún no hay cuentas</h3>
             <p>
-              Agrega tu cuenta de Instagram pegando las cookies de tu sesión. Necesario para
-              perfiles privados y stories.
+              Puedes usar la biblioteca pública sin una cuenta. Agrega una sesión únicamente si
+              necesitas acceder a un perfil privado autorizado.
             </p>
             <button className="btn primary" onClick={openAdd}>
               <Plus size={16} /> Agregar mi cuenta

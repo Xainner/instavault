@@ -27,6 +27,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Sesión deliberadamente vacía para perfiles públicos. Ninguna cookie se
+    /// carga del llavero ni se agrega a la petición.
+    pub fn anonymous() -> Self {
+        Self::from_cookie_header("")
+    }
+
     /// Construye la sesión desde un header de cookies crudo, p.ej.
     /// `sessionid=abc...; csrftoken=xyz...; ds_user_id=123; ig_did=...`.
     /// Conserva el header COMPLETO (la API exige más cookies que las tres
@@ -48,6 +54,24 @@ impl Session {
     /// Válida mínimo: necesita sessionid y csrftoken no vacíos.
     pub fn is_minimally_valid(&self) -> bool {
         !self.sessionid.is_empty() && !self.csrftoken.is_empty()
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        !self.cookie_header.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    #[test]
+    fn anonymous_session_contains_no_credentials() {
+        let session = Session::anonymous();
+        assert!(!session.is_authenticated());
+        assert!(session.cookie_header.is_empty());
+        assert!(session.sessionid.is_empty());
+        assert!(session.csrftoken.is_empty());
     }
 }
 
@@ -108,7 +132,9 @@ impl IgClient {
     pub async fn get_bytes(&self, url: &str, session: &Session) -> anyhow::Result<Vec<u8>> {
         let mut req = self.http.get(url);
         let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_str(&session.cookie_header)?);
+        if !session.cookie_header.is_empty() {
+            headers.insert(COOKIE, HeaderValue::from_str(&session.cookie_header)?);
+        }
         if !session.csrftoken.is_empty() {
             headers.insert(X_CSRF_TOKEN, HeaderValue::from_str(&session.csrftoken)?);
         }

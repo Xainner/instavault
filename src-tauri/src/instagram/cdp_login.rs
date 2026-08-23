@@ -17,12 +17,16 @@ use std::time::{Duration, Instant};
 pub struct CdpSession {
     child: Child,
     port: u16,
+    ephemeral_profile: Option<std::path::PathBuf>,
 }
 
 impl Drop for CdpSession {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(path) = self.ephemeral_profile.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -60,10 +64,28 @@ impl CdpSession {
         Self::launch_with_url("https://www.instagram.com/", true)
     }
 
+    /// Motor público completamente aislado: usa un perfil temporal nuevo y
+    /// modo incógnito, por lo que no puede leer ni reutilizar las cookies del
+    /// perfil persistente empleado para cuentas privadas.
+    pub fn launch_public_api() -> Result<Self> {
+        let profile = std::env::temp_dir().join(format!("IVPublic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&profile).context("no se pudo crear el perfil público temporal")?;
+        Self::launch_with_profile("https://www.instagram.com/", true, profile, true)
+    }
+
     fn launch_with_url(start_url: &str, headless: bool) -> Result<Self> {
+        let profile = profile_dir()?;
+        Self::launch_with_profile(start_url, headless, profile, false)
+    }
+
+    fn launch_with_profile(
+        start_url: &str,
+        headless: bool,
+        profile_dir: std::path::PathBuf,
+        ephemeral: bool,
+    ) -> Result<Self> {
         let exe = find_chromium()?;
         let port = free_port()?;
-        let profile_dir = profile_dir()?;
         std::fs::create_dir_all(&profile_dir).context("no se pudo crear el perfil del navegador")?;
 
         let mut args: Vec<String> = vec![
@@ -72,6 +94,10 @@ impl CdpSession {
             "--no-first-run".into(),
             "--no-default-browser-check".into(),
         ];
+        if ephemeral {
+            args.push("--incognito".into());
+            args.push("--disable-sync".into());
+        }
         if headless {
             args.push("--headless=new".into());
             // Viewport estable: el fallback que parsea HTML asume layout normal.
@@ -86,7 +112,11 @@ impl CdpSession {
             .spawn()
             .with_context(|| format!("no se pudo lanzar {exe:?}"))?;
 
-        Ok(CdpSession { child, port })
+        Ok(CdpSession {
+            child,
+            port,
+            ephemeral_profile: ephemeral.then_some(profile_dir),
+        })
     }
 
     /// Espera a que el CDP HTTP responda de verdad (hasta 25 s).
@@ -151,6 +181,9 @@ impl CdpSession {
     pub fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(path) = self.ephemeral_profile.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -308,9 +341,9 @@ pub fn raw_fetch_for_test(port: u16) -> Result<String> {
 }
 
 /// Ejecuta un GET relativo del API (p. ej. `/api/v1/users/web_profile_info/?username=x`)
-/// DESDE la página de Instagram y devuelve el JSON parseado.
-/// Es el motor de todas las consultas: Instagram bloquea (429) los clientes
-/// HTTP externos, pero responde bien a los fetch del propio navegador.
+/// DESDE una página pública aislada de Instagram y devuelve el JSON parseado.
+/// Las peticiones usan `credentials: omit`: incluso si Instagram establece
+/// cookies anónimas en ese perfil temporal, no se envían al API ni al fallback.
 pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
     let ws_url = page_ws_url(port)?;
     let (mut ws, _resp) = tungstenite::client::connect(&ws_url)
@@ -331,7 +364,7 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
                     try {{
                         const res = await fetch(path, {{
                             headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
-                            credentials: 'include'
+                            credentials: 'omit'
                         }});
                         const t = await res.text();
                         if (res.status === 429) {{
@@ -344,7 +377,13 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
                         if (res.status >= 400) return {{ok:false, why:'http'+res.status}};
                         try {{ const j = JSON.parse(t); return {{ok:true, v:j}}; }}
                         catch(e) {{ return {{ok:false, why:'html'}}; }}
-                    }} catch(e) {{ return {{ok:false, why:'netErr'}}; }}
+                    }} catch(e) {{
+                        if (i + 1 < tries) {{
+                            await new Promise(r => setTimeout(r, 500 * (i + 1)));
+                            continue;
+                        }}
+                        return {{ok:false, why:'netErr'}};
+                    }}
                 }}
                 return {{ok:false, why:'rateLimit'}};
             }};
@@ -358,7 +397,7 @@ pub fn api_fetch_via_page(port: u16, path: &str) -> Result<serde_json::Value> {
                     try {{
                         const res = await fetch('/' + u + '/', {{
                             headers: {{'X-Requested-With':'XMLHttpRequest','X-IG-App-ID':'1217981644879628'}},
-                            credentials: 'include'
+                            credentials: 'omit'
                         }});
                         const t = await res.text();
                         if (res.status === 404) return {{ok:false, why:'notFound'}};

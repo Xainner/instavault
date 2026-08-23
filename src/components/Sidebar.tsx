@@ -88,11 +88,11 @@ export function Sidebar({
 
       {/* Cuenta activa */}
       <div className="side-account">
-        <div className="side-label">Sesión activa</div>
+        <div className="side-label">Acceso a privados</div>
         {accounts.length === 0 ? (
           <div className="account-empty">
             <ShieldCheck size={15} />
-            Sin cuenta — agrega una
+            Modo público — sin cookies
           </div>
         ) : (
           <div className="account-select-row">
@@ -112,7 +112,7 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="side-foot">v1.0.0 · {mediaCount} archivos · <kbd>Ctrl K</kbd></div>
+      <div className="side-foot">v1.0.1 · {mediaCount} archivos · <kbd>Ctrl K</kbd></div>
     </aside>
   );
 }

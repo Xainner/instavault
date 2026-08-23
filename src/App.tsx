@@ -9,7 +9,7 @@ import { ToastProvider } from "./components/Toasts";
 import { AboutView } from "./components/AboutView";
 import { CommandPalette } from "./components/CommandPalette";
 import { UpdaterProvider } from "./components/Updater";
-import { downloadAvatar, getProfileStats, listAccounts, listProfiles, warmSearchEngine } from "./lib/api";
+import { downloadAvatar, getProfileStats, listAccounts, listProfiles } from "./lib/api";
 import type { AccountInfo, Kind, Profile, ProfileStats } from "./types";
 import "./App.css";
 
@@ -40,10 +40,6 @@ function Shell() {
     load().catch(() => setFirstLoad(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    if (accountId) void warmSearchEngine().catch(() => undefined);
-  }, [accountId]);
 
   // Localiza la foto de perfil: el WebView no carga bien la CDN (URLs firmadas
   // que expiran + IPv6 caído), así que se descarga una vez en Rust y se sirve

@@ -1,7 +1,7 @@
 [package]
 name = "instavault"
-version = "1.0.0"
-description = "InstaVault — descarga perfiles, posts, stories y highlights de Instagram con cookies"
+version = "1.0.1"
+description = "InstaVault — biblioteca privada de contenido público y perfiles privados autorizados"
 authors = ["you"]
 edition = "2021"
 

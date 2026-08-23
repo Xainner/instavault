@@ -15,6 +15,9 @@ pub struct AppState {
     pub ig: Arc<IgClient>,
     /// Navegador de login activo (flujo CDP), si hay uno en curso.
     pub cdp: Arc<Mutex<Option<instagram::cdp_login::CdpSession>>>,
+    /// Navegador efímero y aislado para contenido público. Nunca comparte el
+    /// perfil persistente donde vive la sesión de Instagram.
+    pub public_cdp: Arc<Mutex<Option<instagram::cdp_login::CdpSession>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,6 +74,7 @@ pub fn run() {
                 data_dir: dl_dir,
                 ig: Arc::new(ig),
                 cdp: Arc::new(Mutex::new(None)),
+                public_cdp: Arc::new(Mutex::new(None)),
             };
             app.manage(state);
             Ok(())
@@ -86,7 +90,6 @@ pub fn run() {
             commands::login_open,
             commands::login_check,
             commands::login_cancel,
-                    commands::warm_search_engine,
                     commands::fetch_profile,
                     commands::list_profiles,
                     commands::delete_profile,

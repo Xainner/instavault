@@ -24,6 +24,8 @@
 ## ✨ Características
 
 ### Cuentas y sesiones
+- **Modo público sin cookies**: buscar, sincronizar y descargar perfiles públicos no lee el llavero ni inicia la sesión de Instagram.
+- **Aislamiento estricto**: la navegación pública usa un perfil temporal/incógnito y peticiones `credentials: omit`; las cookies solo se cargan cuando el perfil está confirmado como privado.
 - **Tres formas de entrar**: pegar las cookies de tu navegador, **importar desde un perfil de Chrome/Edge/Firefox** (cookies descriptas del keyring del sistema), o **login asistido** en el navegador propio de la app (Chrome headless con CDP).
 - **Cifrado en el keyring del sistema**: las cookies nunca se guardan en claro, ni siquiera en la base de datos.
 - **Validación de sesión** continua (reintenta y detecta expiración), con múltiples cuentas a la vez.
@@ -78,8 +80,8 @@ npm run tauri build
 > El binario final queda en `src-tauri/target/release/instavault.exe` y los bundles en `src-tauri/target/release/bundle/`.
 
 ### Primeros pasos
-1. **Cuentas** → agregá tu sesión (pegando cookies o importando desde tu navegador; también hay login asistido con el navegador de la app).
-2. **Perfiles** → buscá un username. El primer sync es automático; desde el detalle podés sincronizar por tipo (posts / stories / highlights).
+1. **Perfiles** → buscá un username en modo público; no necesitas configurar una cuenta.
+2. **Cuentas** → agrega una sesión únicamente si quieres acceder a contenido privado autorizado.
 3. **Descargar pendientes** → fotos, videos y avatares se guardan dentro de `%APPDATA%/com.xainner.instavault/instakeeper.db`.
 4. **Álbum** → mira lo descargado, expórtalo con “Guardar en dispositivo” o vuelve a descargarlo en máxima calidad.
 

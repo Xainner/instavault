@@ -42,10 +42,11 @@ jobs:
           tagName: v__VERSION__
           releaseName: InstaVault v__VERSION__
           releaseBody: |
-            Primera versión estable de InstaVault.
+            Actualización estable de InstaVault.
 
             - Biblioteca privada en SQLite
             - Descargas en máxima calidad disponible
+            - Modo público aislado y sin cookies; la sesión solo se usa para perfiles privados
             - Actualizaciones automáticas vía GitHub
             - Nueva interfaz oscura profesional
           releaseDraft: true

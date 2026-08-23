@@ -26,7 +26,6 @@ export const deleteAccount = (accountId: number) =>
 // Perfiles
 export const fetchProfile = (accountId: number, username: string) =>
   invoke<Profile>("fetch_profile", { accountId, username });
-export const warmSearchEngine = () => invoke<void>("warm_search_engine");
 
 export const listProfiles = () => invoke<Profile[]>("list_profiles");
 

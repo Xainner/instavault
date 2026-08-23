@@ -2,8 +2,8 @@ use crate::creds;
 use crate::db::Db;
 use crate::instagram::client::{IgClient, Session};
 use crate::instagram::models::{
-    AccountInfo, DownloadJob, DownloadSummary, MediaRow, ProfileRow, ProfileStats, WebProfileInfo,
-    WebProfileUser,
+    AccountInfo, DownloadJob, DownloadSummary, FeedItem, FeedResponse, MediaRow, ProfileRow,
+    ProfileStats, ReelMediaResponse, ReelsMediaResponse, WebProfileInfo, WebProfileUser,
 };
 use crate::instagram::{api, download};
 use crate::AppState;
@@ -328,8 +328,9 @@ pub async fn fetch_profile(
     username: String,
 ) -> Result<ProfileRow, String> {
     use crate::instagram::cdp_login;
-    // Todas las consultas pasan por el navegador (la API bloquea clientes externos).
-    let port = ensure_api_browser(&state).map_err(|e| e.to_string())?;
+    // La privacidad se resuelve siempre de forma anónima. Buscar un perfil
+    // público jamás lee el llavero ni abre el perfil autenticado del navegador.
+    let port = ensure_public_browser(&state).map_err(|e| e.to_string())?;
     let path = format!("/api/v1/users/web_profile_info/?username={username}");
     let json = tokio::task::spawn_blocking(move || {
         cdp_login::api_fetch_via_page(port, &path)
@@ -355,30 +356,10 @@ pub async fn fetch_profile(
     })
 }
 
-/// Prepara Chrome/CDP en segundo plano para que la primera búsqueda no pague
-/// el coste de arranque. No consulta ningún perfil.
-#[tauri::command]
-pub async fn warm_search_engine(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let cdp = state.cdp.clone();
-    tokio::task::spawn_blocking(move || {
-        let wrapper = AppStateRef { cdp };
-        ensure_api_browser_cdp(&wrapper.cdp).map(|_| ())
-    }).await.map_err(|e| e.to_string())?
-}
-
-struct AppStateRef {
-    cdp: std::sync::Arc<std::sync::Mutex<Option<crate::instagram::cdp_login::CdpSession>>>,
-}
-
-/// Asegura que hay un navegador API vivo (con la sesión del perfil de
-/// InstaVault) y devuelve su puerto CDP. Lo lanza si no existe.
-/// Todas las consultas a Instagram pasan por Chrome vía CDP: la API bloquea
-/// (429) los clientes HTTP externos.
-fn ensure_api_browser(state: &AppState) -> Result<u16, String> {
-    ensure_api_browser_cdp(&state.cdp)
-}
-
-fn ensure_api_browser_cdp(cdp: &std::sync::Arc<std::sync::Mutex<Option<crate::instagram::cdp_login::CdpSession>>>) -> Result<u16, String> {
+fn ensure_browser_cdp(
+    cdp: &std::sync::Arc<std::sync::Mutex<Option<crate::instagram::cdp_login::CdpSession>>>,
+    public: bool,
+) -> Result<u16, String> {
     use crate::instagram::cdp_login::CdpSession;
     let mut guard = cdp.lock().map_err(|e| e.to_string())?;
     if let Some(s) = guard.as_mut() {
@@ -388,16 +369,82 @@ fn ensure_api_browser_cdp(cdp: &std::sync::Arc<std::sync::Mutex<Option<crate::in
             return Ok(port);
         }
     }
-    // Sin navegador vivo: mata instancias colgadas y lanza uno nuevo
-    // (home, conserva la sesión del login asistido).
+    // El motor público usa un perfil temporal independiente. Solo el flujo
+    // privado abre el perfil persistente que puede contener una sesión.
     drop(guard);
-    CdpSession::kill_existing();
-    std::thread::sleep(std::time::Duration::from_millis(600));
-    let sess = CdpSession::launch_api().map_err(|e| e.to_string())?;
+    if !public {
+        CdpSession::kill_existing();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    let sess = if public {
+        CdpSession::launch_public_api()
+    } else {
+        CdpSession::launch_api()
+    }
+    .map_err(|e| e.to_string())?;
     sess.wait_ready().map_err(|e| e.to_string())?;
     let port = sess.port();
     *cdp.lock().map_err(|e| e.to_string())? = Some(sess);
     Ok(port)
+}
+
+fn ensure_public_browser(state: &AppState) -> Result<u16, String> {
+    ensure_browser_cdp(&state.public_cdp, true)
+}
+
+fn ensure_private_browser(state: &AppState) -> Result<u16, String> {
+    ensure_browser_cdp(&state.cdp, false)
+}
+
+async fn public_api_json(state: &AppState, path: String) -> Result<serde_json::Value, String> {
+    use crate::instagram::cdp_login;
+    let port = ensure_public_browser(state)?;
+    tokio::task::spawn_blocking(move || cdp_login::api_fetch_via_page(port, &path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn fetch_public_posts(
+    state: &AppState,
+    pk: &str,
+    max_pages: u32,
+) -> Result<Vec<FeedItem>, String> {
+    let mut all = Vec::new();
+    let mut max_id: Option<String> = None;
+    for _ in 0..max_pages {
+        let mut path = format!("/api/v1/feed/user/{pk}/?count=33");
+        if let Some(cursor) = &max_id {
+            path.push_str(&format!("&max_id={cursor}"));
+        }
+        let response: FeedResponse = serde_json::from_value(public_api_json(state, path).await?)
+            .map_err(|e| format!("respuesta pública inesperada: {e}"))?;
+        all.extend(response.items);
+        if !response.more_available || response.next_max_id.is_none() {
+            break;
+        }
+        max_id = response.next_max_id;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+    Ok(all)
+}
+
+async fn fetch_public_reel(state: &AppState, path: String) -> Result<Vec<FeedItem>, String> {
+    let response: ReelsMediaResponse = serde_json::from_value(public_api_json(state, path).await?)
+        .map_err(|e| format!("respuesta pública inesperada: {e}"))?;
+    Ok(response
+        .reels
+        .into_values()
+        .flat_map(|reel| reel.items)
+        .collect())
+}
+
+async fn fetch_public_stories(state: &AppState, pk: &str) -> Result<Vec<FeedItem>, String> {
+    let response: ReelMediaResponse = serde_json::from_value(
+        public_api_json(state, format!("/api/v1/feed/user/{pk}/reel_media/")).await?,
+    )
+    .map_err(|e| format!("respuesta pública inesperada: {e}"))?;
+    Ok(response.items)
 }
 
 #[tauri::command]
@@ -472,6 +519,56 @@ pub fn get_media(
 // Sincronización (fetch metadata → BD)
 // ---------------------------------------------------------------------------
 
+/// Devuelve una sesión vacía para contenido público y solo abre el llavero
+/// cuando la BD confirma explícitamente `is_private = 1`. Un valor desconocido
+/// se trata como público para evitar usar credenciales por accidente.
+fn session_for_profile(
+    state: &AppState,
+    account_id: i64,
+    profile_id: i64,
+) -> Result<Session, String> {
+    let profile = db(state)
+        .lock()
+        .unwrap()
+        .get_profile_by_id(profile_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "perfil no encontrado".to_string())?;
+    if profile_requires_auth(profile.is_private) {
+        if account_id <= 0 {
+            return Err("este perfil es privado; selecciona una cuenta autorizada".to_string());
+        }
+        session(state, account_id).map_err(|e| e.to_string())
+    } else {
+        Ok(Session::anonymous())
+    }
+}
+
+fn profile_requires_auth(is_private: Option<i64>) -> bool {
+    is_private == Some(1)
+}
+
+fn profile_access_by_username(
+    state: &AppState,
+    account_id: i64,
+    username: &str,
+) -> Result<(i64, Session, bool), String> {
+    let dbl = db(state);
+    let profile_id = dbl
+        .lock()
+        .unwrap()
+        .get_profile_id(username)
+        .map_err(|_| "perfil no encontrado; búscalo primero".to_string())?;
+    let is_private = dbl
+        .lock()
+        .unwrap()
+        .get_profile_by_id(profile_id)
+        .map_err(|e| e.to_string())?
+        .map(|p| profile_requires_auth(p.is_private))
+        .unwrap_or(false);
+    let access = session_for_profile(state, account_id, profile_id)?;
+    Ok((profile_id, access, is_private))
+}
+
 #[tauri::command]
 pub async fn sync_posts(
     state: tauri::State<'_, AppState>,
@@ -479,16 +576,20 @@ pub async fn sync_posts(
     username: String,
     max_pages: u32,
 ) -> Result<usize, String> {
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
+    let (profile_id, s, is_private) = profile_access_by_username(&state, account_id, &username)?;
     let ig = state.ig.clone();
     let dbl = db(&state);
-    let profile_id = ensure_profile(&ig, &s, &dbl, &username)
-        .await
-        .map_err(|e| e.to_string())?;
+    if is_private {
+        let _ = ensure_profile(&ig, &s, &dbl, &username).await;
+    }
     let pk = lock_pk(&dbl, profile_id);
-    let items = api::fetch_posts(&ig, &s, &pk, max_pages)
-        .await
-        .map_err(|e| e.to_string())?;
+    let items = if is_private {
+        api::fetch_posts(&ig, &s, &pk, max_pages)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        fetch_public_posts(&state, &pk, max_pages).await?
+    };
     let extracted = items
         .iter()
         .flat_map(|i| api::extract_item(i, "post"))
@@ -530,16 +631,20 @@ pub async fn sync_stories(
     account_id: i64,
     username: String,
 ) -> Result<usize, String> {
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
+    let (profile_id, s, is_private) = profile_access_by_username(&state, account_id, &username)?;
     let ig = state.ig.clone();
     let dbl = db(&state);
-    let profile_id = ensure_profile(&ig, &s, &dbl, &username)
-        .await
-        .map_err(|e| e.to_string())?;
+    if is_private {
+        let _ = ensure_profile(&ig, &s, &dbl, &username).await;
+    }
     let pk = lock_pk(&dbl, profile_id);
-    let items = api::fetch_stories(&ig, &s, &pk)
-        .await
-        .map_err(|e| e.to_string())?;
+    let items = if is_private {
+        api::fetch_stories(&ig, &s, &pk)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        fetch_public_stories(&state, &pk).await?
+    };
     let mut count = 0usize;
     {
         let lock = dbl.lock().unwrap();
@@ -578,17 +683,22 @@ pub async fn sync_highlights(
     username: String,
 ) -> Result<usize, String> {
     use crate::instagram::cdp_login;
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
+    let (profile_id, s, is_private) = profile_access_by_username(&state, account_id, &username)?;
     let ig = state.ig.clone();
     let dbl = db(&state);
-    let profile_id = ensure_profile(&ig, &s, &dbl, &username)
-        .await
-        .map_err(|e| e.to_string())?;
+    if is_private {
+        let _ = ensure_profile(&ig, &s, &dbl, &username).await;
+    }
 
     // El endpoint mobile `highlights_tray` devuelve `status: fail` (caído).
     // Estrategia: leer los reels del DOM de la página de perfil (browser
     // CDP; los muestra incluso logged-out) y el media por `reels_media`.
-    let port = ensure_api_browser(&state).map_err(|e| e.to_string())?;
+    let port = if is_private {
+        ensure_private_browser(&state)
+    } else {
+        ensure_public_browser(&state)
+    }
+    .map_err(|e| e.to_string())?;
     let uname = username.clone();
     let reels = tokio::task::spawn_blocking(move || {
         let url = format!("https://www.instagram.com/{uname}/");
@@ -625,9 +735,20 @@ pub async fn sync_highlights(
     }
     let mut count = 0usize;
     for h in &reels {
-        let items = api::fetch_reels_media(&ig, &s, &format!("highlight:{}", h.id))
-            .await
-            .map_err(|e| e.to_string())?;
+        let items = if is_private {
+            api::fetch_reels_media(&ig, &s, &format!("highlight:{}", h.id))
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            fetch_public_reel(
+                &state,
+                format!(
+                    "/api/v1/feed/reels_media/?reel_ids=highlight%3A{}",
+                    h.id
+                ),
+            )
+            .await?
+        };
         let lock = dbl.lock().unwrap();
         for em in items.iter().flat_map(|i| api::extract_item(i, "highlight")) {
             let row = MediaRow {
@@ -674,7 +795,7 @@ pub async fn download_profile(
     include_failed: bool,
     concurrency: usize,
 ) -> Result<DownloadSummary, String> {
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
+    let s = session_for_profile(&state, account_id, profile_id)?;
     let ig = state.ig.clone();
     let dbl = db(&state);
     let username = {
@@ -749,7 +870,6 @@ pub async fn download_media(
     account_id: i64,
     media_pk: i64,
 ) -> Result<DownloadSummary, String> {
-    let s = session(&state, account_id).map_err(|e| e.to_string())?;
     let ig = state.ig.clone();
     let dbl = db(&state);
     let (row, profile_id, username, kind) = {
@@ -770,6 +890,7 @@ pub async fn download_media(
             .ok_or_else(|| "perfil no encontrado".to_string())?;
         (row, profile_id, username, kind)
     };
+    let s = session_for_profile(&state, account_id, profile_id)?;
     if dbl
         .lock()
         .unwrap()
@@ -968,6 +1089,18 @@ async fn ensure_profile(
     match api::lookup_profile(ig, s, username).await {
         Ok(user) => Ok(dbl.lock().unwrap().upsert_profile(&to_profile_row(&user))?),
         Err(e) => existing.ok_or_else(|| e),
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::profile_requires_auth;
+
+    #[test]
+    fn credentials_are_reserved_for_confirmed_private_profiles() {
+        assert!(profile_requires_auth(Some(1)));
+        assert!(!profile_requires_auth(Some(0)));
+        assert!(!profile_requires_auth(None));
     }
 }
 
