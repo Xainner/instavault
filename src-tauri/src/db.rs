@@ -7,6 +7,7 @@ pub struct ContentRecord {
     pub data: Vec<u8>,
     pub mime_type: String,
     pub byte_size: i64,
+    pub sha256: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub bitrate: Option<i64>,
@@ -23,7 +24,7 @@ impl Db {
         let path = dir.join("instakeeper.db");
         let conn = Connection::open(&path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let db = Db { conn };
+        let mut db = Db { conn };
         db.migrate()?;
         db.migrate_legacy_files()?;
         Ok(db)
@@ -122,6 +123,27 @@ impl Db {
                 sha256        TEXT NOT NULL,
                 downloaded_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS media_thumbnail_content (
+                media_id      INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+                data          BLOB NOT NULL,
+                mime_type     TEXT NOT NULL,
+                byte_size     INTEGER NOT NULL,
+                sha256        TEXT NOT NULL,
+                downloaded_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_progress (
+                profile_id        INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                kind              TEXT NOT NULL,
+                access_mode       TEXT NOT NULL,
+                last_shortcode    TEXT,
+                publications_seen INTEGER NOT NULL DEFAULT 0,
+                status            TEXT NOT NULL,
+                stop_reason       TEXT,
+                updated_at        INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, kind)
+            );
             "#,
         )?;
         // Migration para BDs existentes (idempotente): la columna is_favorite
@@ -137,6 +159,58 @@ impl Db {
             self.conn
                 .execute("ALTER TABLE profiles ADD COLUMN avatar_local_path TEXT", [])?;
         }
+        if !Self::column_exists(&self.conn, "accounts", "auth_mode") {
+            self.conn.execute(
+                "ALTER TABLE accounts ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'legacy_cookie'",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE accounts SET status='reconnect_required' WHERE auth_mode='legacy_cookie'",
+                [],
+            )?;
+        }
+        for (name, definition) in [
+            ("width", "INTEGER"),
+            ("height", "INTEGER"),
+            ("bitrate", "INTEGER"),
+            ("byte_size", "INTEGER"),
+            ("quality_verified", "INTEGER NOT NULL DEFAULT 0"),
+            ("publication_code", "TEXT"),
+            ("child_index", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !Self::column_exists(&self.conn, "media", name) {
+                self.conn.execute(
+                    &format!("ALTER TABLE media ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute(
+            "UPDATE media SET publication_code=code WHERE publication_code IS NULL AND code IS NOT NULL",
+            [],
+        )?;
+        // Recalcular posiciones puede intercambiar índices ya existentes. Se
+        // suspende la restricción durante esta migración idempotente para no
+        // fallar por una colisión transitoria (por ejemplo 0 -> 1 antes de que
+        // el antiguo 1 cambie de posición); se vuelve a crear tras fusionar.
+        self.conn
+            .execute("DROP INDEX IF EXISTS media_publication_asset_unique", [])?;
+        self.assign_canonical_child_indices()?;
+        self.merge_canonical_duplicates()?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS media_publication_asset_unique
+             ON media(profile_id,kind,publication_code,child_index)
+             WHERE publication_code IS NOT NULL",
+            [],
+        )?;
+        // Un parser experimental interpretó los segmentos `/p/` y `/reel/`
+        // como shortcodes. Sólo se retiran esos placeholders exactos cuando
+        // nunca llegaron a contener bytes de la biblioteca.
+        self.conn.execute(
+            "DELETE FROM media WHERE media_id IN ('web_p','web_reel')
+             AND NOT EXISTS (SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)",
+            [],
+        )?;
         // Jobs "en curso" de una sesión anterior: la app murió a mitad de
         // descarga, así que se cierran con lo que alcanzó.
         self.conn.execute(
@@ -146,45 +220,207 @@ impl Db {
         Ok(())
     }
 
-    fn migrate_legacy_files(&self) -> rusqlite::Result<()> {
+    fn assign_canonical_child_indices(&self) -> rusqlite::Result<()> {
+        let mut groups = self.conn.prepare(
+            "SELECT profile_id,kind,publication_code
+             FROM media WHERE publication_code IS NOT NULL
+             GROUP BY profile_id,kind,publication_code HAVING COUNT(*) > 1",
+        )?;
+        let groups = groups
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (profile_id, kind, code) in groups {
+            let mut stmt = self.conn.prepare(
+                "SELECT id,media_id FROM media
+                 WHERE profile_id=?1 AND kind=?2 AND publication_code=?3 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![profile_id, kind, code], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut next_child = 0_i64;
+            for (id, _) in rows
+                .iter()
+                .filter(|(_, media_id)| !media_id.starts_with("web_"))
+            {
+                self.conn.execute(
+                    "UPDATE media SET child_index=?2 WHERE id=?1",
+                    params![id, next_child],
+                )?;
+                next_child += 1;
+            }
+            for (id, _) in rows
+                .iter()
+                .filter(|(_, media_id)| media_id.starts_with("web_"))
+            {
+                self.conn
+                    .execute("UPDATE media SET child_index=0 WHERE id=?1", [id])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_canonical_duplicates(&self) -> rusqlite::Result<()> {
+        let mut groups = self.conn.prepare(
+            "SELECT profile_id,kind,publication_code,child_index
+             FROM media WHERE publication_code IS NOT NULL
+             GROUP BY profile_id,kind,publication_code,child_index HAVING COUNT(*) > 1",
+        )?;
+        let duplicate_groups = groups
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(groups);
+        for (profile_id, kind, code, child_index) in duplicate_groups {
+            let mut ids = self.conn.prepare(
+                "SELECT m.id,
+                        EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=m.id) AS has_blob,
+                        EXISTS(SELECT 1 FROM media_thumbnail_content mt WHERE mt.media_id=m.id) AS has_thumb
+                 FROM media m
+                 WHERE profile_id=?1 AND kind=?2 AND publication_code=?3 AND child_index=?4
+                 ORDER BY has_blob DESC, has_thumb DESC, m.id ASC",
+            )?;
+            let rows = ids
+                .query_map(params![profile_id, kind, code, child_index], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(ids);
+            let Some((survivor, _, _)) = rows.first().copied() else {
+                continue;
+            };
+            for (duplicate, _, _) in rows.into_iter().skip(1) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO media_content
+                     SELECT ?1,data,mime_type,byte_size,sha256,width,height,bitrate,quality_verified,source,downloaded_at
+                     FROM media_content WHERE media_id=?2",
+                    params![survivor, duplicate],
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO media_thumbnail_content
+                     SELECT ?1,data,mime_type,byte_size,sha256,downloaded_at
+                     FROM media_thumbnail_content WHERE media_id=?2",
+                    params![survivor, duplicate],
+                )?;
+                self.conn.execute(
+                    "UPDATE media SET
+                       caption=COALESCE(caption,(SELECT caption FROM media WHERE id=?2)),
+                       taken_at=COALESCE(taken_at,(SELECT taken_at FROM media WHERE id=?2)),
+                       best_url=COALESCE(best_url,(SELECT best_url FROM media WHERE id=?2)),
+                       thumbnail_url=COALESCE(thumbnail_url,(SELECT thumbnail_url FROM media WHERE id=?2))
+                     WHERE id=?1",
+                    params![survivor, duplicate],
+                )?;
+                self.conn
+                    .execute("DELETE FROM media WHERE id=?1", [duplicate])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy_files(&mut self) -> rusqlite::Result<()> {
         let media: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, local_path FROM media WHERE local_path IS NOT NULL
                  AND NOT EXISTS (SELECT 1 FROM media_content WHERE media_id=media.id)",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
+        let mut imported_media = Vec::new();
+        let tx = self.conn.transaction()?;
         for (id, path) in media {
             if let Ok(bytes) = std::fs::read(&path) {
                 if !bytes.is_empty() {
                     let mime = mime_from_path(&path, false);
-                    self.store_media_content(id, &bytes, &mime, None, None, None, false, "legacy")?;
-                    if self.media_content(id)?.map(|c| c.byte_size as usize) == Some(bytes.len()) {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                    let sha = sha256_hex(&bytes);
+                    tx.execute(
+                        "INSERT OR REPLACE INTO media_content
+                         (media_id,data,mime_type,byte_size,sha256,width,height,bitrate,quality_verified,source,downloaded_at)
+                         VALUES (?1,?2,?3,?4,?5,NULL,NULL,NULL,0,'legacy',?6)",
+                        params![id, bytes, mime, bytes.len() as i64, sha, chrono::Utc::now().timestamp()],
+                    )?;
+                    tx.execute(
+                        "UPDATE media SET status='downloaded',error=NULL WHERE id=?1",
+                        [id],
+                    )?;
+                    imported_media.push((id, path, bytes.len(), sha));
                 }
             }
         }
         let avatars: Vec<(i64, String)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id, avatar_local_path FROM profiles WHERE avatar_local_path IS NOT NULL
                  AND NOT EXISTS (SELECT 1 FROM profile_avatar_content WHERE profile_id=profiles.id)",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
+        let mut imported_avatars = Vec::new();
         for (id, path) in avatars {
             if let Ok(bytes) = std::fs::read(&path) {
                 if !bytes.is_empty() {
                     let mime = mime_from_path(&path, false);
-                    self.store_avatar_content(id, &bytes, &mime)?;
-                    if self.avatar_content(id)?.map(|c| c.byte_size as usize) == Some(bytes.len()) {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                    let sha = sha256_hex(&bytes);
+                    tx.execute(
+                        "INSERT OR REPLACE INTO profile_avatar_content
+                         (profile_id,data,mime_type,byte_size,sha256,downloaded_at)
+                         VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            id,
+                            bytes,
+                            mime,
+                            bytes.len() as i64,
+                            sha,
+                            chrono::Utc::now().timestamp()
+                        ],
+                    )?;
+                    imported_avatars.push((id, path, bytes.len(), sha));
                 }
+            }
+        }
+        tx.commit()?;
+        for (id, path, size, sha) in imported_media {
+            let verified: bool = self
+                .conn
+                .query_row(
+                    "SELECT byte_size=?2 AND sha256=?3 FROM media_content WHERE media_id=?1",
+                    params![id, size as i64, sha],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if verified {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        for (id, path, size, sha) in imported_avatars {
+            let verified: bool = self.conn.query_row(
+                "SELECT byte_size=?2 AND sha256=?3 FROM profile_avatar_content WHERE profile_id=?1",
+                params![id, size as i64, sha], |row| row.get(0),
+            ).unwrap_or(false);
+            if verified {
+                let _ = std::fs::remove_file(path);
             }
         }
         Ok(())
@@ -193,9 +429,7 @@ impl Db {
     fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
         // Nombres hardcodeados (sin inyección): solo se consulta la pragma.
         conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
-            ),
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"),
             [],
             |r| r.get::<_, i64>(0),
         )
@@ -216,6 +450,21 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    pub fn add_browser_account(&self, username: &str) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO accounts (username,keyring_ref,added_at,status,auth_mode)
+             VALUES (?1,'dedicated_browser',?2,'valid','dedicated_browser')
+             ON CONFLICT(username) DO UPDATE SET keyring_ref='dedicated_browser',
+             status='valid',auth_mode='dedicated_browser',last_valid=excluded.added_at",
+            params![username, chrono::Utc::now().timestamp()],
+        )?;
+        self.conn.query_row(
+            "SELECT id FROM accounts WHERE username=?1",
+            [username],
+            |row| row.get(0),
+        )
     }
 
     pub fn set_account_status(&self, account_id: i64, status: &str) -> rusqlite::Result<()> {
@@ -258,7 +507,7 @@ impl Db {
         &self,
         p: &crate::instagram::models::ProfileRow,
     ) -> rusqlite::Result<i64> {
-// COALESCE: una fetch degradada (fallback HTML con nulls) no pisa los
+        // COALESCE: una fetch degradada (fallback HTML con nulls) no pisa los
         // valores reales guardados. is_favorite nunca se toca (sobrevive re-fetches).
         self.conn.execute(
             r#"INSERT INTO profiles (username, pk, full_name, biography, followers, following,
@@ -307,42 +556,13 @@ impl Db {
                     is_private, is_verified, profile_pic_url,
                     CASE WHEN EXISTS(SELECT 1 FROM profile_avatar_content a WHERE a.profile_id=profiles.id)
                          THEN 'http://vault.localhost/avatar/' || profiles.id ELSE avatar_local_path END,
+                    (SELECT byte_size FROM profile_avatar_content a WHERE a.profile_id=profiles.id),
                     is_favorite, fetched_at, id
              FROM profiles WHERE id=?1",
         )?;
-        let rows = stmt.query_map(params![id], |r| {
-            Ok(crate::instagram::models::ProfileRow {
-                username: r.get(0)?,
-                pk: r.get(1)?,
-                full_name: r.get(2)?,
-                biography: r.get(3)?,
-                followers: r.get(4)?,
-                following: r.get(5)?,
-                media_count: r.get(6)?,
-                is_private: r.get(7)?,
-                is_verified: r.get(8)?,
-                profile_pic_url: r.get(9)?,
-                avatar_local_path: r.get(10)?,
-                is_favorite: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                fetched_at: r.get(12)?,
-                id: Some(r.get(13)?),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows.into_iter().next())
-    }
-
-    pub fn list_profiles(&self) -> rusqlite::Result<Vec<crate::instagram::models::ProfileRow>> {
-        let mut stmt = self.conn.prepare(
-"SELECT username, pk, full_name, biography, followers, following, media_count,
-                    is_private, is_verified, profile_pic_url,
-                    CASE WHEN EXISTS(SELECT 1 FROM profile_avatar_content a WHERE a.profile_id=profiles.id)
-                         THEN 'http://vault.localhost/avatar/' || profiles.id ELSE avatar_local_path END,
-                    is_favorite, fetched_at, id
-             FROM profiles ORDER BY is_favorite DESC, username",
-        )?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![id], |r| {
+                let content_url: Option<String> = r.get(10)?;
                 Ok(crate::instagram::models::ProfileRow {
                     username: r.get(0)?,
                     pk: r.get(1)?,
@@ -354,10 +574,50 @@ impl Db {
                     is_private: r.get(7)?,
                     is_verified: r.get(8)?,
                     profile_pic_url: r.get(9)?,
-                    avatar_local_path: r.get(10)?,
-                    is_favorite: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    fetched_at: r.get(12)?,
-                    id: Some(r.get(13)?),
+                    avatar_local_path: None,
+                    has_content: content_url.is_some(),
+                    content_url,
+                    byte_size: r.get(11)?,
+                    is_favorite: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                    fetched_at: r.get(13)?,
+                    id: Some(r.get(14)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().next())
+    }
+
+    pub fn list_profiles(&self) -> rusqlite::Result<Vec<crate::instagram::models::ProfileRow>> {
+        let mut stmt = self.conn.prepare(
+"SELECT username, pk, full_name, biography, followers, following, media_count,
+                    is_private, is_verified, profile_pic_url,
+                    CASE WHEN EXISTS(SELECT 1 FROM profile_avatar_content a WHERE a.profile_id=profiles.id)
+                         THEN 'http://vault.localhost/avatar/' || profiles.id ELSE avatar_local_path END,
+                    (SELECT byte_size FROM profile_avatar_content a WHERE a.profile_id=profiles.id),
+                    is_favorite, fetched_at, id
+             FROM profiles ORDER BY is_favorite DESC, username",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let content_url: Option<String> = r.get(10)?;
+                Ok(crate::instagram::models::ProfileRow {
+                    username: r.get(0)?,
+                    pk: r.get(1)?,
+                    full_name: r.get(2)?,
+                    biography: r.get(3)?,
+                    followers: r.get(4)?,
+                    following: r.get(5)?,
+                    media_count: r.get(6)?,
+                    is_private: r.get(7)?,
+                    is_verified: r.get(8)?,
+                    profile_pic_url: r.get(9)?,
+                    avatar_local_path: None,
+                    has_content: content_url.is_some(),
+                    content_url,
+                    byte_size: r.get(11)?,
+                    is_favorite: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                    fetched_at: r.get(13)?,
+                    id: Some(r.get(14)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -366,16 +626,65 @@ impl Db {
 
     // ---- Media ----
     pub fn upsert_media(&self, m: &crate::instagram::models::MediaRow) -> rusqlite::Result<i64> {
+        self.upsert_media_with_result(m).map(|(id, _)| id)
+    }
+
+    pub fn upsert_media_with_result(
+        &self,
+        m: &crate::instagram::models::MediaRow,
+    ) -> rusqlite::Result<(i64, bool)> {
+        let existing = if let (Some(profile_id), Some(code)) = (m.profile_id, &m.publication_code) {
+            self.conn
+                .query_row(
+                    "SELECT id FROM media WHERE profile_id=?1 AND kind=?2 AND publication_code=?3 AND child_index=?4",
+                    params![profile_id, m.kind, code, m.child_index],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT id FROM media WHERE media_id=?1",
+                    params![m.media_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE media SET best_url=?2,thumbnail_url=?3,caption=COALESCE(?4,caption),
+                   media_type=?5,code=COALESCE(?6,code),taken_at=COALESCE(?7,taken_at),
+                   width=?8,height=?9,bitrate=?10,byte_size=?11,quality_verified=?12,
+                   publication_code=COALESCE(?13,publication_code),child_index=?14
+                 WHERE id=?1",
+                params![
+                    id,
+                    m.best_url,
+                    m.thumbnail_url,
+                    m.caption,
+                    m.media_type,
+                    m.code,
+                    m.taken_at,
+                    m.width,
+                    m.height,
+                    m.bitrate,
+                    m.byte_size,
+                    m.quality_verified as i64,
+                    m.publication_code,
+                    m.child_index
+                ],
+            )?;
+            return Ok((id, false));
+        }
         self.conn.execute(
-            r#"INSERT INTO media (media_id, profile_id, kind, code, taken_at, caption, media_type,
-                                  thumbnail_url, best_url, local_path, status, error, created_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-               ON CONFLICT(media_id) DO UPDATE SET
-                 best_url=excluded.best_url, thumbnail_url=excluded.thumbnail_url,
-                 caption=excluded.caption, media_type=excluded.media_type,
-                 code=excluded.code, taken_at=excluded.taken_at"#,
+            r#"INSERT INTO media (media_id, publication_code, child_index, profile_id, kind, code,
+                                  taken_at, caption, media_type, thumbnail_url, best_url, local_path,
+                                  status, error, created_at, width, height, bitrate, byte_size, quality_verified)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)"#,
             params![
                 m.media_id,
+                m.publication_code,
+                m.child_index,
                 m.profile_id,
                 m.kind,
                 m.code,
@@ -387,20 +696,28 @@ impl Db {
                 m.local_path,
                 m.status,
                 m.error,
-                m.created_at
+                m.created_at,
+                m.width,
+                m.height,
+                m.bitrate,
+                m.byte_size,
+                m.quality_verified as i64
             ],
         )?;
-        Ok(self.conn.query_row(
-            "SELECT id FROM media WHERE media_id=?1",
-            params![m.media_id],
-            |r| r.get(0),
-        )?)
+        Ok((self.conn.last_insert_rowid(), true))
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn store_media_content(
-        &self, id: i64, data: &[u8], mime_type: &str, width: Option<i64>,
-        height: Option<i64>, bitrate: Option<i64>, quality_verified: bool, source: &str,
+        &self,
+        id: i64,
+        data: &[u8],
+        mime_type: &str,
+        width: Option<i64>,
+        height: Option<i64>,
+        bitrate: Option<i64>,
+        quality_verified: bool,
+        source: &str,
     ) -> rusqlite::Result<()> {
         let sha = sha256_hex(data);
         self.conn.execute(
@@ -415,23 +732,75 @@ impl Db {
                     quality_verified as i64, source, chrono::Utc::now().timestamp()],
         )?;
         self.conn.execute(
-            "UPDATE media SET status='downloaded', local_path=NULL, error=NULL WHERE id=?1", [id],
+            "UPDATE media SET status='downloaded', local_path=NULL, error=NULL WHERE id=?1",
+            [id],
         )?;
         Ok(())
     }
 
-    pub fn media_content(&self, id: i64) -> rusqlite::Result<Option<ContentRecord>> {
-        self.conn.query_row(
-            "SELECT data,mime_type,byte_size,width,height,bitrate,quality_verified
-             FROM media_content WHERE media_id=?1", [id], |r| Ok(ContentRecord {
-                data: r.get(0)?, mime_type: r.get(1)?, byte_size: r.get(2)?,
-                width: r.get(3)?, height: r.get(4)?, bitrate: r.get(5)?,
-                quality_verified: r.get::<_, i64>(6)? != 0,
-            }),
-        ).optional()
+    pub fn store_media_thumbnail(
+        &self,
+        id: i64,
+        data: &[u8],
+        mime_type: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO media_thumbnail_content (media_id,data,mime_type,byte_size,sha256,downloaded_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(media_id) DO UPDATE SET data=excluded.data,mime_type=excluded.mime_type,
+             byte_size=excluded.byte_size,sha256=excluded.sha256,downloaded_at=excluded.downloaded_at",
+            params![id, data, mime_type, data.len() as i64, sha256_hex(data), chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
     }
 
-    pub fn store_avatar_content(&self, profile_id: i64, data: &[u8], mime_type: &str) -> rusqlite::Result<()> {
+    pub fn thumbnail_content(&self, id: i64) -> rusqlite::Result<Option<ContentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT data,mime_type,byte_size,sha256 FROM media_thumbnail_content WHERE media_id=?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok(ContentRecord {
+                data: r.get(0)?,
+                mime_type: r.get(1)?,
+                byte_size: r.get(2)?,
+                sha256: r.get(3)?,
+                width: None,
+                height: None,
+                bitrate: None,
+                quality_verified: false,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn media_content(&self, id: i64) -> rusqlite::Result<Option<ContentRecord>> {
+        self.conn
+            .query_row(
+                "SELECT data,mime_type,byte_size,sha256,width,height,bitrate,quality_verified
+             FROM media_content WHERE media_id=?1",
+                [id],
+                |r| {
+                    Ok(ContentRecord {
+                        data: r.get(0)?,
+                        mime_type: r.get(1)?,
+                        byte_size: r.get(2)?,
+                        sha256: r.get(3)?,
+                        width: r.get(4)?,
+                        height: r.get(5)?,
+                        bitrate: r.get(6)?,
+                        quality_verified: r.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn store_avatar_content(
+        &self,
+        profile_id: i64,
+        data: &[u8],
+        mime_type: &str,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO profile_avatar_content (profile_id,data,mime_type,byte_size,sha256,downloaded_at)
              VALUES (?1,?2,?3,?4,?5,?6)
@@ -439,14 +808,17 @@ impl Db {
              byte_size=excluded.byte_size,sha256=excluded.sha256,downloaded_at=excluded.downloaded_at",
             params![profile_id, data, mime_type, data.len() as i64, sha256_hex(data), chrono::Utc::now().timestamp()],
         )?;
-        self.conn.execute("UPDATE profiles SET avatar_local_path=NULL WHERE id=?1", [profile_id])?;
+        self.conn.execute(
+            "UPDATE profiles SET avatar_local_path=NULL WHERE id=?1",
+            [profile_id],
+        )?;
         Ok(())
     }
 
     pub fn avatar_content(&self, profile_id: i64) -> rusqlite::Result<Option<ContentRecord>> {
         self.conn.query_row(
-            "SELECT data,mime_type,byte_size,NULL,NULL,NULL,1 FROM profile_avatar_content WHERE profile_id=?1",
-            [profile_id], |r| Ok(ContentRecord { data:r.get(0)?, mime_type:r.get(1)?, byte_size:r.get(2)?,
+            "SELECT data,mime_type,byte_size,sha256,NULL,NULL,NULL,1 FROM profile_avatar_content WHERE profile_id=?1",
+            [profile_id], |r| Ok(ContentRecord { data:r.get(0)?, mime_type:r.get(1)?, byte_size:r.get(2)?, sha256:r.get(3)?,
                 width:None, height:None, bitrate:None, quality_verified:true }),
         ).optional()
     }
@@ -461,10 +833,19 @@ impl Db {
 
     /// Vuelve un medio descargado a pendiente (permite re-descargarlo).
     pub fn reset_download(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM media_content WHERE media_id=?1", [id])?;
+        self.conn
+            .execute("DELETE FROM media_content WHERE media_id=?1", [id])?;
         self.conn.execute(
             "UPDATE media SET status='metadata', local_path=NULL, error=NULL WHERE id=?1",
             params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_candidates_unverified(&self, profile_id: i64, kind: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE media SET quality_verified=0 WHERE profile_id=?1 AND kind=?2",
+            params![profile_id, kind],
         )?;
         Ok(())
     }
@@ -478,7 +859,9 @@ impl Db {
         let n = if let Some(k) = kind {
             self.conn.execute(
                 "DELETE FROM media_content WHERE media_id IN
-                 (SELECT id FROM media WHERE profile_id=?1 AND kind=?2)", params![profile_id, k])?;
+                 (SELECT id FROM media WHERE profile_id=?1 AND kind=?2)",
+                params![profile_id, k],
+            )?;
             self.conn.execute(
                 "UPDATE media SET status='metadata', local_path=NULL, error=NULL
                  WHERE profile_id=?1 AND kind=?2 AND status='downloaded'",
@@ -487,7 +870,9 @@ impl Db {
         } else {
             self.conn.execute(
                 "DELETE FROM media_content WHERE media_id IN
-                 (SELECT id FROM media WHERE profile_id=?1)", [profile_id])?;
+                 (SELECT id FROM media WHERE profile_id=?1)",
+                [profile_id],
+            )?;
             self.conn.execute(
                 "UPDATE media SET status='metadata', local_path=NULL, error=NULL
                  WHERE profile_id=?1 AND status='downloaded'",
@@ -507,7 +892,15 @@ impl Db {
                     thumbnail_url, best_url,
                     CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
                          THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
-                    status, error, created_at, id
+                    COALESCE((SELECT byte_size FROM media_content mc WHERE mc.media_id=media.id),media.byte_size),
+                    COALESCE((SELECT width FROM media_content mc WHERE mc.media_id=media.id),media.width),
+                    COALESCE((SELECT height FROM media_content mc WHERE mc.media_id=media.id),media.height),
+                    COALESCE((SELECT bitrate FROM media_content mc WHERE mc.media_id=media.id),media.bitrate),
+                    COALESCE((SELECT quality_verified FROM media_content mc WHERE mc.media_id=media.id),media.quality_verified,0),
+                    status, error, created_at, id,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_thumbnail_content mt WHERE mt.media_id=media.id)
+                         THEN 'http://vault.localhost/thumbnail/' || media.id ELSE NULL END,
+                    publication_code, child_index
              FROM media WHERE profile_id=?1",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(profile_id)];
@@ -515,14 +908,23 @@ impl Db {
             sql.push_str(" AND kind=?2");
             params.push(Box::new(k.to_string()));
         }
-        sql.push_str(" ORDER BY taken_at DESC");
+        // El fallback DOM de Instagram no siempre expone `taken_at`. Esos
+        // medios sí son válidos y se insertan siguiendo el orden de la
+        // cuadrícula (más reciente primero). Si ordenamos sólo por taken_at,
+        // SQLite coloca todos los NULL al final y una sincronización privada
+        // parece no haber actualizado nada. `created_at` conserva el momento
+        // en que se descubrió el medio e `id ASC` mantiene el orden del lote.
+        sql.push_str(" ORDER BY COALESCE(taken_at, created_at) DESC, id ASC");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
                 rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
                 |r| {
+                    let content_url: Option<String> = r.get(9)?;
                     Ok(crate::instagram::models::MediaRow {
                         media_id: r.get(0)?,
+                        publication_code: r.get(20)?,
+                        child_index: r.get(21)?,
                         profile_id: r.get(1)?,
                         kind: r.get(2)?,
                         code: r.get(3)?,
@@ -530,17 +932,123 @@ impl Db {
                         caption: r.get(5)?,
                         media_type: r.get(6)?,
                         thumbnail_url: r.get(7)?,
+                        thumbnail_content_url: r.get(19)?,
                         best_url: r.get(8)?,
-                        local_path: r.get(9)?,
-                        status: r.get(10)?,
-                        error: r.get(11)?,
-                        created_at: r.get(12)?,
-                        id: Some(r.get(13)?),
+                        local_path: None,
+                        has_content: content_url.is_some(),
+                        content_url,
+                        byte_size: r.get(10)?,
+                        width: r.get(11)?,
+                        height: r.get(12)?,
+                        bitrate: r.get(13)?,
+                        quality_verified: r.get::<_, i64>(14)? != 0,
+                        status: r.get(15)?,
+                        error: r.get(16)?,
+                        created_at: r.get(17)?,
+                        id: Some(r.get(18)?),
                     })
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn publication_count(&self, profile_id: i64, kind: &str) -> rusqlite::Result<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(DISTINCT COALESCE(publication_code,code,media_id))
+             FROM media WHERE profile_id=?1 AND kind=?2",
+            params![profile_id, kind],
+            |row| row.get::<_, i64>(0).map(|value| value.max(0) as usize),
+        )
+    }
+
+    pub fn publication_exists(
+        &self,
+        profile_id: i64,
+        kind: &str,
+        code: &str,
+    ) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media WHERE profile_id=?1 AND kind=?2
+                           AND COALESCE(publication_code,code)=?3)",
+            params![profile_id, kind, code],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn sync_progress(
+        &self,
+        profile_id: i64,
+        kind: &str,
+    ) -> rusqlite::Result<Option<crate::instagram::models::SyncProgressRow>> {
+        use crate::instagram::models::{SyncAccessMode, SyncProgressRow, SyncStatus};
+        self.conn
+            .query_row(
+                "SELECT access_mode,last_shortcode,publications_seen,status,stop_reason,updated_at
+                 FROM sync_progress WHERE profile_id=?1 AND kind=?2",
+                params![profile_id, kind],
+                |row| {
+                    let access: String = row.get(0)?;
+                    let status: String = row.get(3)?;
+                    let access_mode = if access == "authenticated_explicit" {
+                        SyncAccessMode::AuthenticatedExplicit
+                    } else {
+                        SyncAccessMode::PublicAnonymous
+                    };
+                    let status = match status.as_str() {
+                        "complete" => SyncStatus::Complete,
+                        "anonymous_limit" => SyncStatus::AnonymousLimit,
+                        "stalled" => SyncStatus::Stalled,
+                        "rate_limited" => SyncStatus::RateLimited,
+                        "challenge_required" => SyncStatus::ChallengeRequired,
+                        "cancelled" => SyncStatus::Cancelled,
+                        _ => SyncStatus::MoreAvailable,
+                    };
+                    Ok(SyncProgressRow {
+                        profile_id,
+                        kind: kind.to_string(),
+                        access_mode,
+                        last_shortcode: row.get(1)?,
+                        publications_seen: row.get::<_, i64>(2)?.max(0) as usize,
+                        status,
+                        stop_reason: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn save_sync_progress(
+        &self,
+        progress: &crate::instagram::models::SyncProgressRow,
+    ) -> rusqlite::Result<()> {
+        let access = match progress.access_mode {
+            crate::instagram::models::SyncAccessMode::PublicAnonymous => "public_anonymous",
+            crate::instagram::models::SyncAccessMode::AuthenticatedExplicit => {
+                "authenticated_explicit"
+            }
+        };
+        self.conn.execute(
+            "INSERT INTO sync_progress
+             (profile_id,kind,access_mode,last_shortcode,publications_seen,status,stop_reason,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(profile_id,kind) DO UPDATE SET
+               access_mode=excluded.access_mode,last_shortcode=excluded.last_shortcode,
+               publications_seen=excluded.publications_seen,status=excluded.status,
+               stop_reason=excluded.stop_reason,updated_at=excluded.updated_at",
+            params![
+                progress.profile_id,
+                progress.kind,
+                access,
+                progress.last_shortcode,
+                progress.publications_seen as i64,
+                progress.status.as_str(),
+                progress.stop_reason,
+                progress.updated_at
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn pending_downloads(
@@ -552,13 +1060,24 @@ impl Db {
                     thumbnail_url, best_url,
                     CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
                          THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
-                    status, error, created_at, id
+                    COALESCE((SELECT byte_size FROM media_content mc WHERE mc.media_id=media.id),media.byte_size),
+                    COALESCE((SELECT width FROM media_content mc WHERE mc.media_id=media.id),media.width),
+                    COALESCE((SELECT height FROM media_content mc WHERE mc.media_id=media.id),media.height),
+                    COALESCE((SELECT bitrate FROM media_content mc WHERE mc.media_id=media.id),media.bitrate),
+                    COALESCE((SELECT quality_verified FROM media_content mc WHERE mc.media_id=media.id),media.quality_verified,0),
+                    status, error, created_at, id,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_thumbnail_content mt WHERE mt.media_id=media.id)
+                         THEN 'http://vault.localhost/thumbnail/' || media.id ELSE NULL END,
+                    publication_code, child_index
              FROM media WHERE status='metadata' AND best_url IS NOT NULL LIMIT ?1",
         )?;
         let rows = stmt
             .query_map(params![limit], |r| {
+                let content_url: Option<String> = r.get(9)?;
                 Ok(crate::instagram::models::MediaRow {
                     media_id: r.get(0)?,
+                    publication_code: r.get(20)?,
+                    child_index: r.get(21)?,
                     profile_id: r.get(1)?,
                     kind: r.get(2)?,
                     code: r.get(3)?,
@@ -566,12 +1085,20 @@ impl Db {
                     caption: r.get(5)?,
                     media_type: r.get(6)?,
                     thumbnail_url: r.get(7)?,
+                    thumbnail_content_url: r.get(19)?,
                     best_url: r.get(8)?,
-                    local_path: r.get(9)?,
-                    status: r.get(10)?,
-                    error: r.get(11)?,
-                    created_at: r.get(12)?,
-                    id: Some(r.get(13)?),
+                    local_path: None,
+                    has_content: content_url.is_some(),
+                    content_url,
+                    byte_size: r.get(10)?,
+                    width: r.get(11)?,
+                    height: r.get(12)?,
+                    bitrate: r.get(13)?,
+                    quality_verified: r.get::<_, i64>(14)? != 0,
+                    status: r.get(15)?,
+                    error: r.get(16)?,
+                    created_at: r.get(17)?,
+                    id: Some(r.get(18)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -619,8 +1146,10 @@ impl Db {
 
     /// Guarda la ruta local de la foto de perfil ya descargada.
     pub fn set_avatar_path(&self, profile_id: i64, path: &str) -> rusqlite::Result<()> {
-        self.conn
-            .execute("UPDATE profiles SET avatar_local_path=?2 WHERE id=?1", params![profile_id, path])?;
+        self.conn.execute(
+            "UPDATE profiles SET avatar_local_path=?2 WHERE id=?1",
+            params![profile_id, path],
+        )?;
         Ok(())
     }
 
@@ -656,9 +1185,9 @@ impl Db {
         > = std::collections::HashMap::new();
 
         {
-            let mut stmt = self.conn.prepare(
-                "SELECT profile_id, COUNT(*) FROM media GROUP BY profile_id",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT profile_id, COUNT(*) FROM media GROUP BY profile_id")?;
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -668,7 +1197,10 @@ impl Db {
         }
         {
             let mut stmt = self.conn.prepare(
-                "SELECT profile_id, kind, COUNT(*),
+                "SELECT profile_id, kind,
+                        COUNT(DISTINCT CASE WHEN kind='post'
+                              THEN COALESCE(publication_code,code,media_id)
+                              ELSE CAST(id AS TEXT) END),
                         COALESCE(SUM(status='downloaded'),0), COALESCE(SUM(status='failed'),0)
                  FROM media GROUP BY profile_id, kind",
             )?;
@@ -699,9 +1231,9 @@ impl Db {
             }
         }
         {
-            let mut stmt = self.conn.prepare(
-                "SELECT profile_id, kind, last_sync FROM sync_stats",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT profile_id, kind, last_sync FROM sync_stats")?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok((
@@ -731,7 +1263,7 @@ impl Db {
             }
         }
 
-let mut out = Vec::with_capacity(by_profile.len());
+        let mut out = Vec::with_capacity(by_profile.len());
         for (pid, (total, kinds)) in by_profile {
             out.push(ProfileStats {
                 profile_id: pid,
@@ -752,12 +1284,23 @@ let mut out = Vec::with_capacity(by_profile.len());
                     thumbnail_url, best_url,
                     CASE WHEN EXISTS(SELECT 1 FROM media_content mc WHERE mc.media_id=media.id)
                          THEN 'http://vault.localhost/media/' || media.id ELSE local_path END,
-                    status, error, created_at, id
+                    COALESCE((SELECT byte_size FROM media_content mc WHERE mc.media_id=media.id),media.byte_size),
+                    COALESCE((SELECT width FROM media_content mc WHERE mc.media_id=media.id),media.width),
+                    COALESCE((SELECT height FROM media_content mc WHERE mc.media_id=media.id),media.height),
+                    COALESCE((SELECT bitrate FROM media_content mc WHERE mc.media_id=media.id),media.bitrate),
+                    COALESCE((SELECT quality_verified FROM media_content mc WHERE mc.media_id=media.id),media.quality_verified,0),
+                    status, error, created_at, id,
+                    CASE WHEN EXISTS(SELECT 1 FROM media_thumbnail_content mt WHERE mt.media_id=media.id)
+                         THEN 'http://vault.localhost/thumbnail/' || media.id ELSE NULL END,
+                    publication_code, child_index
              FROM media WHERE id=?1",
         )?;
         let mut rows = stmt.query_map(params![id], |r| {
+            let content_url: Option<String> = r.get(9)?;
             Ok(crate::instagram::models::MediaRow {
                 media_id: r.get(0)?,
+                publication_code: r.get(20)?,
+                child_index: r.get(21)?,
                 profile_id: r.get(1)?,
                 kind: r.get(2)?,
                 code: r.get(3)?,
@@ -765,12 +1308,20 @@ let mut out = Vec::with_capacity(by_profile.len());
                 caption: r.get(5)?,
                 media_type: r.get(6)?,
                 thumbnail_url: r.get(7)?,
+                thumbnail_content_url: r.get(19)?,
                 best_url: r.get(8)?,
-                local_path: r.get(9)?,
-                status: r.get(10)?,
-                error: r.get(11)?,
-                created_at: r.get(12)?,
-                id: Some(r.get(13)?),
+                local_path: None,
+                has_content: content_url.is_some(),
+                content_url,
+                byte_size: r.get(10)?,
+                width: r.get(11)?,
+                height: r.get(12)?,
+                bitrate: r.get(13)?,
+                quality_verified: r.get::<_, i64>(14)? != 0,
+                status: r.get(15)?,
+                error: r.get(16)?,
+                created_at: r.get(17)?,
+                id: Some(r.get(18)?),
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -794,7 +1345,10 @@ let mut out = Vec::with_capacity(by_profile.len());
         Ok(())
     }
 
-    pub fn list_jobs(&self, limit: i64) -> rusqlite::Result<Vec<crate::instagram::models::DownloadJob>> {
+    pub fn list_jobs(
+        &self,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<crate::instagram::models::DownloadJob>> {
         use crate::instagram::models::DownloadJob;
         let mut stmt = self.conn.prepare(
             "SELECT j.id, j.profile_id, p.username, j.kind, j.total, j.ok, j.failed,
@@ -821,7 +1375,7 @@ let mut out = Vec::with_capacity(by_profile.len());
     }
 
     /// Hay un job en curso para este perfil+kind (para no lanzar dos descargas
-/// concurrentes del mismo lote: escribirían sobre los mismos archivos).
+    /// concurrentes del mismo lote: escribirían sobre los mismos archivos).
     pub fn has_active_job(&self, profile_id: i64, kind: &str) -> rusqlite::Result<bool> {
         let n = self.conn.query_row(
             "SELECT COUNT(*) FROM download_jobs WHERE profile_id=?1 AND kind=?2 AND finished_at IS NULL",
@@ -832,8 +1386,10 @@ let mut out = Vec::with_capacity(by_profile.len());
     }
 
     pub fn clear_finished_jobs(&self) -> rusqlite::Result<()> {
-        self.conn
-            .execute("DELETE FROM download_jobs WHERE finished_at IS NOT NULL", [])?;
+        self.conn.execute(
+            "DELETE FROM download_jobs WHERE finished_at IS NOT NULL",
+            [],
+        )?;
         Ok(())
     }
 }
@@ -893,6 +1449,9 @@ mod tests {
             is_verified: Some(0),
             profile_pic_url: None,
             avatar_local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
             is_favorite: 0,
             fetched_at: Some(1),
             id: None,
@@ -902,6 +1461,8 @@ mod tests {
 
         let m = MediaRow {
             media_id: "abc_1".into(),
+            publication_code: Some("ABC".into()),
+            child_index: 0,
             profile_id: Some(pid),
             kind: "post".into(),
             code: Some("ABC".into()),
@@ -909,20 +1470,40 @@ mod tests {
             caption: Some("hola".into()),
             media_type: Some(1),
             thumbnail_url: Some("http://t".into()),
+            thumbnail_content_url: None,
             best_url: Some("http://b".into()),
             local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
+            width: None,
+            height: None,
+            bitrate: None,
+            quality_verified: false,
             status: "metadata".into(),
             error: None,
             created_at: Some(3),
             id: None,
         };
         let mid = db.upsert_media(&m).unwrap();
-        db.store_media_content(mid, b"image-bytes", "image/jpeg", Some(1080), Some(1350), None, true, "test").unwrap();
+        db.store_media_content(
+            mid,
+            b"image-bytes",
+            "image/jpeg",
+            Some(1080),
+            Some(1350),
+            None,
+            true,
+            "test",
+        )
+        .unwrap();
         let med = db.media_by_profile(pid, Some("post")).unwrap();
         assert_eq!(med.len(), 1);
         assert_eq!(med[0].status, "downloaded");
         let expected = format!("http://vault.localhost/media/{mid}");
-        assert_eq!(med[0].local_path.as_deref(), Some(expected.as_str()));
+        assert_eq!(med[0].content_url.as_deref(), Some(expected.as_str()));
+        assert!(med[0].has_content);
+        assert_eq!(med[0].byte_size, Some(b"image-bytes".len() as i64));
 
         // cascada: al borrar el perfil se borra el media
         db.delete_profile_cascade(pid).unwrap();
@@ -945,6 +1526,9 @@ mod tests {
             is_verified: Some(0),
             profile_pic_url: None,
             avatar_local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
             is_favorite: 0,
             fetched_at: None,
             id: None,
@@ -952,6 +1536,8 @@ mod tests {
         let pid = db.upsert_profile(&p).unwrap();
         let mk = |code: &str| MediaRow {
             media_id: "same_id".into(),
+            publication_code: None,
+            child_index: 0,
             profile_id: Some(pid),
             kind: "post".into(),
             code: Some(code.into()),
@@ -959,8 +1545,16 @@ mod tests {
             caption: None,
             media_type: None,
             thumbnail_url: None,
+            thumbnail_content_url: None,
             best_url: Some(format!("http://{code}")),
             local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
+            width: None,
+            height: None,
+            bitrate: None,
+            quality_verified: false,
             status: "metadata".into(),
             error: None,
             created_at: None,
@@ -971,6 +1565,141 @@ mod tests {
         let med = db.media_by_profile(pid, Some("post")).unwrap();
         assert_eq!(med.len(), 1);
         assert_eq!(med[0].code.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn newly_discovered_dom_media_is_not_hidden_behind_dated_media() {
+        let db = temp_db();
+        let pid = db
+            .upsert_profile(&mk_profile("private-grid", None))
+            .unwrap();
+        let mk = |media_id: &str, taken_at: Option<i64>, created_at: i64| MediaRow {
+            media_id: media_id.into(),
+            publication_code: Some(media_id.into()),
+            child_index: 0,
+            profile_id: Some(pid),
+            kind: "post".into(),
+            code: Some(media_id.into()),
+            taken_at,
+            caption: None,
+            media_type: Some(1),
+            thumbnail_url: Some(format!("https://cdn.invalid/{media_id}.jpg")),
+            thumbnail_content_url: None,
+            best_url: Some(format!("https://cdn.invalid/{media_id}.jpg")),
+            local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
+            width: Some(1080),
+            height: Some(1080),
+            bitrate: None,
+            quality_verified: false,
+            status: "metadata".into(),
+            error: None,
+            created_at: Some(created_at),
+            id: None,
+        };
+        db.upsert_media(&mk("old-dated", Some(100), 100)).unwrap();
+        db.upsert_media(&mk("new-dom-first", None, 200)).unwrap();
+        db.upsert_media(&mk("new-dom-second", None, 200)).unwrap();
+
+        let media = db.media_by_profile(pid, Some("post")).unwrap();
+        let ids: Vec<_> = media.iter().map(|item| item.media_id.as_str()).collect();
+        assert_eq!(ids, ["new-dom-first", "new-dom-second", "old-dated"]);
+    }
+
+    #[test]
+    fn canonical_migration_merges_web_placeholder_without_losing_carousel_blobs() {
+        let db = temp_db();
+        let pid = db.upsert_profile(&mk_profile("carousel", None)).unwrap();
+        db.conn
+            .execute("DROP INDEX media_publication_asset_unique", [])
+            .unwrap();
+        for media_id in ["100_0", "100_1", "web_CODE"] {
+            db.conn
+                .execute(
+                    "INSERT INTO media
+                     (media_id,profile_id,kind,code,publication_code,child_index,status,created_at)
+                     VALUES (?1,?2,'post','CODE','CODE',0,'metadata',1)",
+                    params![media_id, pid],
+                )
+                .unwrap();
+        }
+        let first: i64 = db
+            .conn
+            .query_row("SELECT id FROM media WHERE media_id='100_0'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let second: i64 = db
+            .conn
+            .query_row("SELECT id FROM media WHERE media_id='100_1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let web: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM media WHERE media_id='web_CODE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.store_media_content(
+            first,
+            b"first",
+            "image/jpeg",
+            None,
+            None,
+            None,
+            true,
+            "test",
+        )
+        .unwrap();
+        db.store_media_content(
+            second,
+            b"second",
+            "image/jpeg",
+            None,
+            None,
+            None,
+            true,
+            "test",
+        )
+        .unwrap();
+        db.store_media_thumbnail(web, b"thumb", "image/jpeg")
+            .unwrap();
+
+        db.assign_canonical_child_indices().unwrap();
+        db.merge_canonical_duplicates().unwrap();
+
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM media WHERE publication_code='CODE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blobs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_content mc JOIN media m ON m.id=mc.media_id
+                 WHERE m.publication_code='CODE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let thumbs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_thumbnail_content mt JOIN media m ON m.id=mt.media_id
+                 WHERE m.publication_code='CODE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((rows, blobs, thumbs), (2, 2, 1));
     }
 
     fn mk_profile(username: &str, pic: Option<&str>) -> ProfileRow {
@@ -986,6 +1715,9 @@ mod tests {
             is_verified: Some(1),
             profile_pic_url: pic.map(|s| s.to_string()),
             avatar_local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
             is_favorite: 0,
             fetched_at: Some(1),
             id: None,
@@ -995,7 +1727,8 @@ mod tests {
     #[test]
     fn upsert_profile_keeps_old_values_on_null() {
         let db = temp_db();
-        db.upsert_profile(&mk_profile("ana", Some("https://pic/1.jpg"))).unwrap();
+        db.upsert_profile(&mk_profile("ana", Some("https://pic/1.jpg")))
+            .unwrap();
         // Fetch degradada: todo null → no pisa foto ni conteos.
         let degraded = ProfileRow {
             profile_pic_url: None,
@@ -1010,7 +1743,10 @@ mod tests {
             ..mk_profile("ana", None)
         };
         db.upsert_profile(&degraded).unwrap();
-        let p = db.get_profile_by_id(db.get_profile_id("ana").unwrap()).unwrap().unwrap();
+        let p = db
+            .get_profile_by_id(db.get_profile_id("ana").unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(p.profile_pic_url.as_deref(), Some("https://pic/1.jpg"));
         assert_eq!(p.followers, Some(10));
         assert_eq!(p.pk.as_deref(), Some("999"));
@@ -1038,6 +1774,8 @@ mod tests {
         let pid = db.upsert_profile(&mk_profile("ana", None)).unwrap();
         let mk = |mid: &str| MediaRow {
             media_id: mid.into(),
+            publication_code: None,
+            child_index: 0,
             profile_id: Some(pid),
             kind: "post".into(),
             code: None,
@@ -1045,8 +1783,16 @@ mod tests {
             caption: None,
             media_type: None,
             thumbnail_url: None,
+            thumbnail_content_url: None,
             best_url: Some("u".into()),
             local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
+            width: None,
+            height: None,
+            bitrate: None,
+            quality_verified: false,
             status: "metadata".into(),
             error: None,
             created_at: None,
@@ -1056,7 +1802,8 @@ mod tests {
         let b = db.upsert_media(&mk("b")).unwrap();
         let c = db.upsert_media(&mk("c")).unwrap();
         db.mark_failed(a, "HTTP 404").unwrap();
-        db.store_media_content(b, b"b", "image/jpeg", None, None, None, false, "test").unwrap();
+        db.store_media_content(b, b"b", "image/jpeg", None, None, None, false, "test")
+            .unwrap();
         // c queda metadata.
         let n = db.reset_failed(pid, "post").unwrap();
         assert_eq!(n, 1);
@@ -1074,6 +1821,8 @@ mod tests {
         let pid = db.upsert_profile(&mk_profile("ana", None)).unwrap();
         let mk = |mid: &str| MediaRow {
             media_id: mid.into(),
+            publication_code: None,
+            child_index: 0,
             profile_id: Some(pid),
             kind: "post".into(),
             code: None,
@@ -1081,8 +1830,16 @@ mod tests {
             caption: None,
             media_type: None,
             thumbnail_url: None,
+            thumbnail_content_url: None,
             best_url: Some("u".into()),
             local_path: None,
+            has_content: false,
+            content_url: None,
+            byte_size: None,
+            width: None,
+            height: None,
+            bitrate: None,
+            quality_verified: false,
             status: "metadata".into(),
             error: None,
             created_at: None,
@@ -1090,7 +1847,8 @@ mod tests {
         };
         let a = db.upsert_media(&mk("a")).unwrap();
         let _ = db.upsert_media(&mk("b")).unwrap();
-        db.store_media_content(a, b"a", "image/jpeg", None, None, None, false, "test").unwrap();
+        db.store_media_content(a, b"a", "image/jpeg", None, None, None, false, "test")
+            .unwrap();
         db.record_sync(pid, "post").unwrap();
         db.record_sync(pid, "story").unwrap(); // sin media: aparece solo por la sync
         let stats = db.profile_stats().unwrap();
@@ -1131,24 +1889,91 @@ mod tests {
 
     #[test]
     fn legacy_file_is_verified_then_migrated_to_blob() {
-        let dir = std::env::temp_dir().join(format!("instakeeper_migrate_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("instakeeper_migrate_{}", uuid::Uuid::new_v4()));
         let legacy = dir.join("legacy.jpg");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&legacy, b"legacy-image-bytes").unwrap();
         let db = Db::open(&dir).unwrap();
         let pid = db.upsert_profile(&mk_profile("migration", None)).unwrap();
-        let mid = db.upsert_media(&MediaRow {
-            media_id: "legacy-media".into(), profile_id: Some(pid), kind: "post".into(),
-            code: None, taken_at: None, caption: None, media_type: Some(1),
-            thumbnail_url: None, best_url: Some("https://example.invalid/a.jpg".into()),
-            local_path: Some(legacy.to_string_lossy().to_string()), status: "downloaded".into(),
-            error: None, created_at: None, id: None,
-        }).unwrap();
+        let mid = db
+            .upsert_media(&MediaRow {
+                media_id: "legacy-media".into(),
+                publication_code: None,
+                child_index: 0,
+                profile_id: Some(pid),
+                kind: "post".into(),
+                code: None,
+                taken_at: None,
+                caption: None,
+                media_type: Some(1),
+                thumbnail_url: None,
+                thumbnail_content_url: None,
+                best_url: Some("https://example.invalid/a.jpg".into()),
+                local_path: Some(legacy.to_string_lossy().to_string()),
+                has_content: false,
+                content_url: None,
+                byte_size: None,
+                width: None,
+                height: None,
+                bitrate: None,
+                quality_verified: false,
+                status: "downloaded".into(),
+                error: None,
+                created_at: None,
+                id: None,
+            })
+            .unwrap();
         drop(db);
         let reopened = Db::open(&dir).unwrap();
         let stored = reopened.media_content(mid).unwrap().unwrap();
         assert_eq!(stored.data, b"legacy-image-bytes");
         assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "requiere INSTAVAULT_MIGRATION_COPY_DIR"]
+    fn real_library_copy_migrates_without_content_loss() {
+        let dir = std::env::var_os("INSTAVAULT_MIGRATION_COPY_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("define INSTAVAULT_MIGRATION_COPY_DIR");
+        let path = dir.join("instakeeper.db");
+        let before = rusqlite::Connection::open(&path).unwrap();
+        let profiles_before: i64 = before
+            .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))
+            .unwrap();
+        let media_before: i64 = before
+            .query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))
+            .unwrap();
+        let blobs_before: i64 = before
+            .query_row("SELECT COUNT(*) FROM media_content", [], |row| row.get(0))
+            .unwrap();
+        drop(before);
+
+        let migrated = Db::open(&dir).expect("la migración falló");
+        let integrity: String = migrated
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        let profiles_after: i64 = migrated
+            .conn
+            .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))
+            .unwrap();
+        let media_after: i64 = migrated
+            .conn
+            .query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0))
+            .unwrap();
+        let blobs_after: i64 = migrated
+            .conn
+            .query_row("SELECT COUNT(*) FROM media_content", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(profiles_after, profiles_before);
+        assert!(media_after <= media_before);
+        assert_eq!(blobs_after, blobs_before);
+        println!(
+            "migration_ok profiles={profiles_before}->{profiles_after} media={media_before}->{media_after} blobs={blobs_before}->{blobs_after}"
+        );
     }
 }

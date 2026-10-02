@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -21,8 +21,9 @@ import {
   Star,
   Trash2,
   Video,
+  X,
 } from "lucide-react";
-import type { Kind, Media, Profile, ProfileStats } from "../types";
+import type { Kind, Media, Profile, ProfileStats, SyncAccessMode, SyncProgress, SyncSummary } from "../types";
 import {
   clearDownloads,
   exportAvatar,
@@ -31,10 +32,13 @@ import {
   downloadMedia,
   downloadProfile,
   getMedia,
+  getSyncProgress,
   onDownloadProgress,
+  onSyncState,
+  cancelSync,
   resetDownload,
   syncHighlights,
-  syncPosts,
+  syncFeed,
   syncStories,
 } from "../lib/api";
 import { useToast } from "./Toasts";
@@ -101,19 +105,31 @@ export function MediaDetail({
   const [reDl, setReDl] = useState<number | null>(null);
   const [clearConfirm, setClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const autoSynced = useRef(false);
+  const [syncOperation, setSyncOperation] = useState<string | null>(null);
+  const [syncStage, setSyncStage] = useState("");
+  const [privateSyncConfirm, setPrivateSyncConfirm] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
+  const [publicAuthPrompt, setPublicAuthPrompt] = useState(false);
 
   const load = async () => {
     setLoading(true);
     try {
-      const all = await getMedia(prof.id!);
+      const [all, progress] = await Promise.all([
+        getMedia(prof.id!),
+        getSyncProgress(prof.id!, "post"),
+      ]);
+      setSyncProgress(progress);
       setMedia(
         kind === "album"
           ? all.filter((m) => m.status === "downloaded")
           : all.filter((m) => m.kind === kind),
       );
       const c: Record<string, number> = {};
-      for (const m of all) c[m.kind] = (c[m.kind] || 0) + 1;
+      const postCodes = new Set(
+        all.filter((m) => m.kind === "post").map((m) => m.publication_code || m.code || m.media_id),
+      );
+      for (const m of all) if (m.kind !== "post") c[m.kind] = (c[m.kind] || 0) + 1;
+      c.post = postCodes.size;
       c.album = all.filter((m) => m.status === "downloaded").length;
       setCounts(c);
     } catch (e) {
@@ -128,47 +144,7 @@ export function MediaDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind]);
 
-  // Auto-sync al abrir un perfil vacío (p.ej. recién buscado): trae posts,
-  // stories y highlights de una vez, solo metadatos (sin descargar).
-  useEffect(() => {
-    if (autoSynced.current || !prof.id || busy) return;
-    autoSynced.current = true;
-    (async () => {
-      try {
-        const all = await getMedia(prof.id!);
-        if (all.length > 0) return;
-        setBusy("sync");
-        let n = 0;
-        try {
-          n += await syncPosts(accountId, prof.username, 4);
-        } catch {
-          /* un kind fallido no frena el resto */
-        }
-        try {
-          n += await syncStories(accountId, prof.username);
-        } catch {
-          /* noop */
-        }
-        try {
-          n += await syncHighlights(accountId, prof.username);
-        } catch {
-          /* noop */
-        }
-        toast(
-          n > 0 ? "success" : "info",
-          "Sincronización automática",
-          n > 0 ? `${n} medios en la base.` : "No se encontraron medios.",
-        );
-        load();
-        onChanged();
-      } catch {
-        /* noop */
-      } finally {
-        setBusy(null);
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prof.id]);
+  // Abrir la biblioteca es local. La sincronización requiere pulsar el botón.
 
   /// "Guardar en este equipo": diálogo de destino + copia del archivo local.
   const saveToPC = async (target: { mediaId?: number; avatarId?: number }, filename: string) => {
@@ -200,22 +176,81 @@ export function MediaDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prof.id, kind]);
 
-  const doSync = async () => {
+  const showFeedResult = (summary: SyncSummary) => {
+    if (summary.status === "complete") {
+      toast("success", "Sincronización completa", `${summary.local_publications} publicaciones · ${summary.asset_count} activos en el lote.`);
+    } else if (summary.status === "more_available") {
+      toast("success", `${summary.batch_publications} publicaciones procesadas`, "Hay más contenido. Usa “Continuar sincronización”.");
+    } else if (summary.status === "anonymous_limit") {
+      toast("warning", "Acceso anónimo limitado", summary.stop_reason || "Puedes completar con la sesión dedicada.");
+      setPublicAuthPrompt(true);
+      setPrivateSyncConfirm(true);
+    } else {
+      toast("warning", "Sincronización parcial", summary.stop_reason || "El avance quedó guardado para continuar.");
+    }
+  };
+
+  const doSync = async (accessMode?: SyncAccessMode, continuation = false) => {
     if (!isKind(kind)) return;
     setBusy("sync");
+    setSyncStage(prof.is_private === 1 ? "Preparando sesión privada" : "Preparando acceso anónimo");
+    let unlisten: (() => void) | undefined;
     try {
-      let n = 0;
-      if (kind === "post") n = await syncPosts(accountId, prof.username, 4);
-      if (kind === "story") n = await syncStories(accountId, prof.username);
-      if (kind === "highlight") n = await syncHighlights(accountId, prof.username);
-      toast("success", "Sincronizado", `${n} medios en la base.`);
-      load();
+      unlisten = await onSyncState((state) => {
+        if (state.profile_id && state.profile_id !== prof.id) return;
+        setSyncOperation(state.operation_id);
+        if (state.stage !== "finished") setSyncStage(state.stage);
+      });
+      if (kind === "post") {
+        const summary = await syncFeed(
+          prof.id!,
+          accessMode === "authenticated_explicit" ? accountId : null,
+          accessMode || (prof.is_private === 1 ? "authenticated_explicit" : "public_anonymous"),
+          continuation,
+          30,
+        );
+        showFeedResult(summary);
+      } else {
+        const n = kind === "story"
+          ? await syncStories(accountId, prof.username)
+          : await syncHighlights(accountId, prof.username);
+        toast("success", "Sincronizado", `${n} medios en la base.`);
+      }
+      await load();
       onChanged();
     } catch (e) {
       toast("error", "Error al sincronizar", String(e));
     } finally {
+      unlisten?.();
       setBusy(null);
+      setSyncOperation(null);
+      setSyncStage("");
     }
+  };
+
+  const requestSync = () => {
+    const continuation = kind === "post" && !!syncProgress && syncProgress.status !== "complete";
+    if (prof.is_private === 1 && sessionStorage.getItem("instavault-private-sync-warning") !== "accepted") {
+      setPublicAuthPrompt(false);
+      setPrivateSyncConfirm(true);
+      return;
+    }
+    if (prof.is_private !== 1 && continuation && (
+      syncProgress?.status === "anonymous_limit" || syncProgress?.access_mode === "authenticated_explicit"
+    )) {
+      setPublicAuthPrompt(true);
+      setPrivateSyncConfirm(true);
+      return;
+    }
+    void doSync(prof.is_private === 1 ? "authenticated_explicit" : "public_anonymous", continuation);
+  };
+
+  const confirmPrivateSync = () => {
+    if (!publicAuthPrompt) sessionStorage.setItem("instavault-private-sync-warning", "accepted");
+    setPrivateSyncConfirm(false);
+    const continuation = kind === "post" && !!syncProgress && syncProgress.status !== "complete";
+    void doSync("authenticated_explicit", continuation || publicAuthPrompt);
+    setPublicAuthPrompt(false);
   };
 
   const doDownload = async (includeFailed = false) => {
@@ -312,8 +347,12 @@ export function MediaDetail({
     });
 
   const toMediaSrc = (path: string) => path.includes("vault.localhost") ? path : convertFileSrc(path);
-  const thumb = (m: Media) =>
-    m.local_path ? toMediaSrc(m.local_path) : m.thumbnail_url;
+  // La vista local nunca solicita miniaturas a Instagram. Si todavía no hay
+  // BLOB, se muestra el estado pendiente hasta una descarga explícita.
+  const thumb = (m: Media) => {
+    const local = m.content_url ?? m.thumbnail_content_url;
+    return local ? toMediaSrc(local) : null;
+  };
 
   const kindStats = isKind(kind) ? (stats?.kinds.find((k) => k.kind === kind) ?? null) : null;
   const failedCount = media.filter((m) => m.status === "failed").length;
@@ -325,7 +364,7 @@ export function MediaDetail({
           <ArrowLeft size={15} /> Volver
         </button>
         <div className="detail-id">
-          <ProfileAvatar url={prof.profile_pic_url} localPath={prof.avatar_local_path} name={prof.username} size={46} ring />
+          <ProfileAvatar url={prof.profile_pic_url} localPath={prof.content_url} name={prof.username} size={46} ring />
           <div>
             <div className="detail-name">
               {prof.full_name || prof.username}
@@ -371,7 +410,7 @@ export function MediaDetail({
                 className="dropdown right"
               >
                 {isKind(kind) && (
-                  <button onClick={() => { setMenu(false); doSync(); }}>
+                  <button onClick={() => { setMenu(false); requestSync(); }}>
                     <RefreshCw size={14} /> Sincronizar {TABS.find((k) => k.id === kind)?.label}
                   </button>
                 )}
@@ -387,7 +426,7 @@ export function MediaDetail({
         <button
           className="btn ghost sm"
           onClick={() => saveToPC({ avatarId: prof.id ?? undefined }, `avatar_${prof.username}.jpg`)}
-          disabled={!prof.avatar_local_path || saving}
+          disabled={!prof.has_content || saving}
           title="Guardar foto de perfil en este equipo"
         >
           {saving ? <Loader2 size={14} className="spin" /> : <FolderDown size={14} />}
@@ -442,12 +481,21 @@ export function MediaDetail({
         {isKind(kind) && (
           <button
             className="btn ghost sm"
-            onClick={doSync}
+            onClick={requestSync}
             disabled={busy !== null}
             title={`Sincronizar ${TABS.find((k) => k.id === kind)?.label}`}
           >
             {busy === "sync" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
-            Sincronizar
+            {busy === "sync"
+              ? syncStage || "Sincronizando"
+              : kind === "post" && syncProgress && syncProgress.status !== "complete"
+                ? "Continuar sincronización"
+                : "Sincronizar"}
+          </button>
+        )}
+        {busy === "sync" && syncOperation && (
+          <button className="btn ghost sm danger" onClick={() => void cancelSync(syncOperation)} title="Cancelar sincronización">
+            <X size={14} /> Cancelar
           </button>
         )}
       </div>
@@ -511,12 +559,12 @@ export function MediaDetail({
                   className={`media-cell ${sel ? "selected" : ""} ${m.status === "failed" ? "failed" : ""}`}
                   onClick={() => (t ? setLight(m) : toggleSel(m.id!))}
                 >
-                  {m.media_type === 2 && m.local_path ? (
+                  {m.media_type === 2 && m.content_url ? (
                     // Video descargado: el primer frame sirve de portada local
                     // (el <img> con bytes MP4 siempre fallaría).
                     <video
-                      key={m.local_path}
-                      src={toMediaSrc(m.local_path)}
+                      key={m.content_url}
+                      src={toMediaSrc(m.content_url)}
                       preload="metadata"
                       muted
                       className="media-video"
@@ -592,9 +640,9 @@ export function MediaDetail({
             >
 {(() => {
                  const isVideo = light.media_type === 2;
-                 const src = light.local_path
-                   ? toMediaSrc(light.local_path)
-                   : (light.best_url ?? light.thumbnail_url) ?? "";
+                 const src = light.content_url
+                   ? toMediaSrc(light.content_url)
+                   : "";
                  return isVideo ? (
                    <video
                      key={src}
@@ -627,7 +675,7 @@ export function MediaDetail({
                       {light.status === "failed" ? "Reintentar" : "Descargar"}
                     </button>
                   )}
-                  {light.status === "downloaded" && light.local_path && (
+                  {light.status === "downloaded" && light.content_url && (
                     <button
                       className="btn ghost sm"
                       disabled={saving}
@@ -676,9 +724,9 @@ export function MediaDetail({
                     </span>
                   )}
                   {light.caption && <p>{light.caption}</p>}
-                  {light.local_path && (
-                    <span className="lightbox-path" title={light.local_path}>
-                      <FolderOpen size={13} /> {light.local_path}
+                  {light.content_url && (
+                    <span className="lightbox-path" title={light.content_url}>
+                      <FolderOpen size={13} /> Guardado en la biblioteca privada
                     </span>
                   )}
                 </div>
@@ -687,6 +735,17 @@ export function MediaDetail({
           </motion.div>
         )}
       </AnimatePresence>
+
+      <Modal
+        open={privateSyncConfirm}
+        onClose={() => setPrivateSyncConfirm(false)}
+        title={publicAuthPrompt ? "Completar con sesión dedicada" : "Usar sesión privada"}
+        icon={<AlertTriangle size={18} />}
+        width={440}
+      >
+        <p className="confirm-text">{publicAuthPrompt ? "Instagram limitó el acceso anónimo. " : ""}Esta acción abrirá el navegador dedicado y usará su sesión únicamente para <strong>@{prof.username}</strong>. La autorización aplica sólo a esta sincronización y se detendrá ante cualquier limitación o revisión de seguridad.</p>
+        <div className="modal-actions"><button className="btn ghost" onClick={() => setPrivateSyncConfirm(false)}>Cancelar</button><button className="btn primary" onClick={confirmPrivateSync}>Continuar una vez</button></div>
+      </Modal>
 
       <Modal
         open={confirm}

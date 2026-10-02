@@ -5,6 +5,7 @@ pub mod instagram;
 
 use instagram::client::IgClient;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -18,6 +19,9 @@ pub struct AppState {
     /// Navegador efímero y aislado para contenido público. Nunca comparte el
     /// perfil persistente donde vive la sesión de Instagram.
     pub public_cdp: Arc<Mutex<Option<instagram::cdp_login::CdpSession>>>,
+    /// Una única operación remota a la vez. El bool permite cancelación
+    /// cooperativa entre páginas sin matar la biblioteca local.
+    pub instagram_operation: Arc<Mutex<Option<(String, Arc<AtomicBool>)>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -37,19 +41,43 @@ pub fn run() {
                 let lock = state.db.lock().ok()?;
                 match kind {
                     "media" => lock.media_content(id).ok().flatten(),
+                    "thumbnail" => lock.thumbnail_content(id).ok().flatten(),
                     "avatar" => lock.avatar_content(id).ok().flatten(),
                     _ => None,
                 }
             });
             let Some(content) = content else {
-                return tauri::http::Response::builder().status(404).body(Vec::new()).unwrap();
+                return tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap();
             };
             let total = content.data.len();
-            let range = request.headers().get(tauri::http::header::RANGE)
-                .and_then(|v| v.to_str().ok()).and_then(|v| parse_range(v, total));
-            let (status, start, end) = range.map(|(s,e)| (206, s, e))
-                .unwrap_or((200, 0, total.saturating_sub(1)));
-            let body = if total == 0 { Vec::new() } else { content.data[start..=end].to_vec() };
+            let requested_range = request
+                .headers()
+                .get(tauri::http::header::RANGE)
+                .and_then(|v| v.to_str().ok());
+            let range = requested_range.and_then(|value| parse_range(value, total));
+            if requested_range.is_some() && range.is_none() {
+                return tauri::http::Response::builder()
+                    .status(416)
+                    .header(
+                        tauri::http::header::CONTENT_RANGE,
+                        format!("bytes */{total}"),
+                    )
+                    .header(tauri::http::header::ACCEPT_RANGES, "bytes")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+            let (status, start, end) =
+                range
+                    .map(|(s, e)| (206, s, e))
+                    .unwrap_or((200, 0, total.saturating_sub(1)));
+            let body = if total == 0 {
+                Vec::new()
+            } else {
+                content.data[start..=end].to_vec()
+            };
             let mut response = tauri::http::Response::builder()
                 .status(status)
                 .header(tauri::http::header::CONTENT_TYPE, content.mime_type)
@@ -57,7 +85,10 @@ pub fn run() {
                 .header(tauri::http::header::CONTENT_LENGTH, body.len().to_string())
                 .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
             if status == 206 {
-                response = response.header(tauri::http::header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+                response = response.header(
+                    tauri::http::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                );
             }
             response.body(body).unwrap()
         })
@@ -75,49 +106,83 @@ pub fn run() {
                 ig: Arc::new(ig),
                 cdp: Arc::new(Mutex::new(None)),
                 public_cdp: Arc::new(Mutex::new(None)),
+                instagram_operation: Arc::new(Mutex::new(None)),
             };
             app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::add_account,
-            commands::validate_account,
             commands::list_accounts,
             commands::delete_account,
-            commands::list_browser_profiles,
-            commands::import_browser_account,
-            commands::close_browser,
             commands::login_open,
+            commands::connect_private_account,
             commands::login_check,
             commands::login_cancel,
-                    commands::fetch_profile,
-                    commands::list_profiles,
-                    commands::delete_profile,
-                    commands::get_media,
-                    commands::sync_posts,
-                    commands::sync_stories,
-                    commands::sync_highlights,
-commands::download_profile,
-                     commands::download_media,
-                     commands::reset_download,
-                     commands::clear_downloads,
-commands::set_profile_favorite,
-                     commands::download_avatar,
-                     commands::get_profile_stats,
-commands::list_download_jobs,
-                     commands::clear_finished_jobs,
-                     commands::export_media,
-                     commands::export_avatar,
-                ])
+            commands::disconnect_private_account,
+            commands::lookup_public_profile,
+            commands::add_private_profile,
+            commands::list_profiles,
+            commands::delete_profile,
+            commands::get_media,
+            commands::sync_posts,
+            commands::sync_stories,
+            commands::sync_highlights,
+            commands::sync_profile,
+            commands::sync_feed,
+            commands::get_sync_progress,
+            commands::cancel_sync,
+            commands::download_profile,
+            commands::download_media,
+            commands::reset_download,
+            commands::clear_downloads,
+            commands::set_profile_favorite,
+            commands::download_avatar,
+            commands::get_profile_stats,
+            commands::list_download_jobs,
+            commands::clear_finished_jobs,
+            commands::export_media,
+            commands::export_avatar,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
 fn parse_range(value: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
     let spec = value.strip_prefix("bytes=")?.split(',').next()?;
     let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let length = suffix.min(total);
+        return Some((total - length, total - 1));
+    }
     let start = start.parse::<usize>().ok()?;
-    if start >= total { return None; }
-    let end = end.parse::<usize>().ok().unwrap_or(total.saturating_sub(1));
-    Some((start, end.min(total.saturating_sub(1))))
+    if start >= total {
+        return None;
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<usize>().ok()?.min(total - 1)
+    };
+    (end >= start).then_some((start, end))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::parse_range;
+
+    #[test]
+    fn supports_closed_open_and_suffix_ranges() {
+        assert_eq!(parse_range("bytes=2-5", 10), Some((2, 5)));
+        assert_eq!(parse_range("bytes=6-", 10), Some((6, 9)));
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_range("bytes=20-", 10), None);
+        assert_eq!(parse_range("bytes=6-2", 10), None);
+    }
 }

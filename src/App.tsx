@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Sidebar, type View } from "./components/Sidebar";
 import { AccountsView } from "./components/AccountsView";
 import { ProfilesView } from "./components/ProfilesView";
@@ -9,7 +9,7 @@ import { ToastProvider } from "./components/Toasts";
 import { AboutView } from "./components/AboutView";
 import { CommandPalette } from "./components/CommandPalette";
 import { UpdaterProvider } from "./components/Updater";
-import { downloadAvatar, getProfileStats, listAccounts, listProfiles } from "./lib/api";
+import { getProfileStats, listAccounts, listProfiles } from "./lib/api";
 import type { AccountInfo, Kind, Profile, ProfileStats } from "./types";
 import "./App.css";
 
@@ -40,28 +40,6 @@ function Shell() {
     load().catch(() => setFirstLoad(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Localiza la foto de perfil: el WebView no carga bien la CDN (URLs firmadas
-  // que expiran + IPv6 caído), así que se descarga una vez en Rust y se sirve
-  // vía asset-protocol. Disparo en background por perfil sin copia local.
-  const avatarBusy = useRef<Set<number>>(new Set());
-  useEffect(() => {
-    for (const p of profiles) {
-      if (!p.id || !p.profile_pic_url || p.avatar_local_path) continue;
-      const id = p.id;
-      if (avatarBusy.current.has(id)) continue;
-      avatarBusy.current.add(id);
-      downloadAvatar(id)
-        .then((path) => {
-          if (!path) return;
-          setProfiles((prev) =>
-            prev.map((q) => (q.id === id ? { ...q, avatar_local_path: path } : q)),
-          );
-        })
-        .catch(() => {})
-        .finally(() => avatarBusy.current.delete(id));
-    }
-  }, [profiles]);
 
   const onChanged = useCallback(() => {
     load();
@@ -172,8 +150,10 @@ function Shell() {
 
 export default function App() {
   return (
-    <ToastProvider>
-      <UpdaterProvider><Shell /></UpdaterProvider>
-    </ToastProvider>
+    <MotionConfig reducedMotion="user">
+      <ToastProvider>
+        <UpdaterProvider><Shell /></UpdaterProvider>
+      </ToastProvider>
+    </MotionConfig>
   );
 }

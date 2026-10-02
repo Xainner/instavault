@@ -23,11 +23,13 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Kind, Profile, ProfileStats } from "../types";
 import {
   deleteProfile,
+  downloadAvatar,
   downloadProfile,
-  fetchProfile,
+  addPrivateProfile,
+  lookupPublicProfile,
   setProfileFavorite,
   syncHighlights,
-  syncPosts,
+  syncFeed,
   syncStories,
 } from "../lib/api";
 import { Modal } from "./Modal";
@@ -63,16 +65,15 @@ export function ProfileAvatar({
   ring?: boolean;
 }) {
   const [err, setErr] = useState(false);
-  // La copia local (descargada en Rust, servida por asset-protocol) siempre
-  // gana: la URL remota de la CDN expira y su IPv6 puede estar caído.
-  const src = localPath ? (localPath.includes("vault.localhost") ? localPath : convertFileSrc(localPath)) : url;
-  // Una URL nueva (re-fetch) puede ser válida aunque la anterior fallara.
+  // Nunca se carga la URL remota al abrir la biblioteca. El avatar sólo se
+  // muestra cuando sus bytes ya están dentro del vault SQLite.
+  const src = localPath ? (localPath.includes("vault.localhost") ? localPath : convertFileSrc(localPath)) : null;
   useEffect(() => setErr(false), [src]);
   return (
     <div
       className={`pfp ${ring ? "ring" : ""}`}
       style={{ width: size, height: size }}
-      title={err ? `FALLO al cargar imagen: ${src ?? ""}` : (src ?? "sin URL en base de datos")}
+      title={err ? "No se pudo leer el avatar local" : (src ?? (url ? "Avatar pendiente de guardar en la biblioteca" : "Sin avatar"))}
     >
       {src && !err ? (
         <img
@@ -132,13 +133,34 @@ export function ProfileCard({
 
   const doSync = async (kind: Kind) => {
     if (busy) return;
+    if (p.is_private === 1 && sessionStorage.getItem("instavault-private-sync-warning") !== "accepted") {
+      toast("warning", "Confirmación privada requerida", "Abre el perfil y confirma el uso de la sesión dedicada.");
+      onOpen(p);
+      return;
+    }
     setBusy(kind);
     try {
-      let n = 0;
-      if (kind === "post") n = await syncPosts(accountId, p.username, 4);
-      if (kind === "story") n = await syncStories(accountId, p.username);
-      if (kind === "highlight") n = await syncHighlights(accountId, p.username);
-      toast("success", `Sincronizado`, `${n} medios en la base de datos.`);
+      if (kind === "post") {
+        const result = await syncFeed(
+          p.id!,
+          p.is_private === 1 ? accountId : null,
+          p.is_private === 1 ? "authenticated_explicit" : "public_anonymous",
+          false,
+          30,
+        );
+        if (result.status === "complete") {
+          toast("success", "Sincronización completa", `${result.local_publications} publicaciones en la biblioteca.`);
+        } else {
+          toast("warning", `${result.batch_publications} publicaciones procesadas`, result.stop_reason || "Abre el perfil para continuar la sincronización.");
+          onOpen(p);
+        }
+      } else {
+        const n = kind === "story"
+          ? await syncStories(accountId, p.username)
+          : await syncHighlights(accountId, p.username);
+        toast("success", "Sincronizado", `${n} medios en la base de datos.`);
+      }
+      onDeleted();
     } catch (e) {
       toast("error", "Error al sincronizar", String(e));
     } finally {
@@ -195,7 +217,7 @@ export function ProfileCard({
       onClick={() => onOpen(p)}
     >
       <div className="profile-top">
-        <ProfileAvatar url={p.profile_pic_url} localPath={p.avatar_local_path} name={p.username} size={54} ring />
+        <ProfileAvatar url={p.profile_pic_url} localPath={p.content_url} name={p.username} size={54} ring />
         <div className="profile-id">
           <div className="profile-user">
             {p.full_name || p.username}
@@ -301,7 +323,7 @@ export function ProfileCard({
           className="btn ghost sm"
           disabled={busy !== null}
           onClick={() => doSync("post")}
-          title="Sincronizar posts (paginación 4)"
+          title="Sincronizar publicaciones (lote reanudable de 30)"
         >
           {busy === "post" ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
           Sincronizar
@@ -371,6 +393,16 @@ export function ProfilesView({
   const [searchPhase, setSearchPhase] = useState("");
   const [elapsed, setElapsed] = useState(0);
   const [onlyFav, setOnlyFav] = useState(false);
+  const [privateCandidate, setPrivateCandidate] = useState<string | null>(null);
+
+  const errorInfo = (reason: unknown) => {
+    const raw = String(reason);
+    try {
+      const start = raw.indexOf("{");
+      const value = JSON.parse(start >= 0 ? raw.slice(start) : raw) as { code?: string; message?: string };
+      return { code: value.code ?? "network", message: value.message ?? raw };
+    } catch { return { code: "network", message: raw }; }
+  };
 
   const doSearch = async (username: string) => {
     const u = username.trim().replace(/^@/, "");
@@ -385,20 +417,40 @@ export function ProfilesView({
       if (seconds >= 1) setSearchPhase("Consultando Instagram");
     }, 250);
     try {
-      const p = await fetchProfile(accountId, u);
+      const p = await lookupPublicProfile(u);
       setSearchPhase("Guardando perfil");
+      if (p.id && p.profile_pic_url) await downloadAvatar(p.id).catch(() => null);
       if (p.is_private === 1)
         toast("info", `@${p.username} es privado`, "Sincroniza desde la tarjeta para acceder.");
       toast("success", `@${p.username} en tu biblioteca`);
       setQuery("");
       onChanged();
     } catch (e) {
-      toast("error", "No se encontró", String(e));
+      const info = errorInfo(e);
+      if (info.code === "public_blocked") setPrivateCandidate(u);
+      toast(info.code === "public_blocked" ? "warning" : "error", info.code === "public_blocked" ? "Acceso público bloqueado" : "No se encontró", info.message);
     } finally {
       window.clearInterval(timer);
       setSaving(false);
       setSearchPhase("");
     }
+  };
+
+  const tryPrivate = async () => {
+    if (!privateCandidate || !accountId) {
+      toast("warning", "Conecta una cuenta", "El intento privado requiere una sesión dedicada explícita.");
+      return;
+    }
+    setSaving(true);
+    setSearchPhase("Preparando sesión privada");
+    try {
+      const profile = await addPrivateProfile(privateCandidate, accountId);
+      if (profile.id && profile.profile_pic_url) await downloadAvatar(profile.id).catch(() => null);
+      toast("success", `@${profile.username} en tu biblioteca`, "Se utilizó únicamente la sesión privada dedicada.");
+      setPrivateCandidate(null); setQuery(""); onChanged();
+    } catch (reason) {
+      toast("error", "No se pudo acceder como privado", errorInfo(reason).message);
+    } finally { setSaving(false); setSearchPhase(""); }
   };
 
   const q = query.trim().toLowerCase();
@@ -434,8 +486,10 @@ export function ProfilesView({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && canRemoteSearch && !saving) {
-                doSearch(query);
+              if (e.key === "Enter" && !saving) {
+                const exact = profiles.find((profile) => profile.username.toLowerCase() === q);
+                if (exact) onOpen(exact);
+                else if (canRemoteSearch) doSearch(query);
               }
             }}
           />
@@ -500,7 +554,12 @@ export function ProfilesView({
                     ))}
                   </AnimatePresence>
                 </div>
-              )}
+      )}
+
+      <Modal open={!!privateCandidate} onClose={() => setPrivateCandidate(null)} title="Intentar como perfil privado" icon={<Lock size={18} />} width={460}>
+        <p className="confirm-text">Instagram no entregó <strong>@{privateCandidate}</strong> de forma anónima. Puedes hacer un segundo intento explícito con el navegador privado dedicado. Esta acción no se ejecutará automáticamente.</p>
+        <div className="modal-actions"><button className="btn ghost" onClick={() => setPrivateCandidate(null)}>Cancelar</button><button className="btn primary" onClick={tryPrivate} disabled={!accountId || saving}><Lock size={15} /> Intentar como privado</button></div>
+      </Modal>
             </div>
           );
         }

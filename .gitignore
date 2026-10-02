@@ -26,6 +26,10 @@ avatars/
 *.pfx
 *.p12
 *.sig
+*.cookies
+browser-profile/
+backups/
+dumps/
 
 # Editor directories and files
 .vscode/*

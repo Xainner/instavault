@@ -29,6 +29,8 @@ jobs:
         run: npm ci
       - name: Test frontend
         run: npm run build
+      - name: Test cookie isolation
+        run: node --test scripts/privacy-boundary.test.mjs
       - name: Test backend
         working-directory: src-tauri
         run: cargo test

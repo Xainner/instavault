@@ -9,23 +9,23 @@ import type {
   Media,
   Profile,
   ProfileStats,
+  SyncAccessMode,
+  SyncProgress,
+  SyncSummary,
 } from "../types";
 
-// Cuentas
-export const addAccount = (username: string, cookieHeader: string) =>
-  invoke<AccountInfo>("add_account", { username, cookieHeader });
-
-export const validateAccount = (accountId: number) =>
-  invoke<AccountInfo>("validate_account", { accountId });
-
+// Cuentas privadas: sólo el navegador dedicado administra su sesión.
 export const listAccounts = () => invoke<AccountInfo[]>("list_accounts");
 
 export const deleteAccount = (accountId: number) =>
   invoke<void>("delete_account", { accountId });
 
 // Perfiles
-export const fetchProfile = (accountId: number, username: string) =>
-  invoke<Profile>("fetch_profile", { accountId, username });
+export const lookupPublicProfile = (username: string) =>
+  invoke<Profile>("lookup_public_profile", { username });
+
+export const addPrivateProfile = (username: string, accountId: number) =>
+  invoke<Profile>("add_private_profile", { username, accountId });
 
 export const listProfiles = () => invoke<Profile[]>("list_profiles");
 
@@ -36,7 +36,7 @@ export const getMedia = (profileId: number, kind?: Kind) =>
   invoke<Media[]>("get_media", { profileId, kind });
 
 // Sincronización
-export const syncPosts = (accountId: number, username: string, maxPages = 4) =>
+export const syncPosts = (accountId: number, username: string, maxPages = 30) =>
   invoke<number>("sync_posts", { accountId, username, maxPages });
 
 export const syncStories = (accountId: number, username: string) =>
@@ -44,6 +44,29 @@ export const syncStories = (accountId: number, username: string) =>
 
 export const syncHighlights = (accountId: number, username: string) =>
   invoke<number>("sync_highlights", { accountId, username });
+
+export const syncProfile = (profileId: number, kind: Kind, accountId?: number) =>
+  invoke<number>("sync_profile", { profileId, kind, accountId: accountId || null });
+
+export const syncFeed = (
+  profileId: number,
+  accountId: number | null,
+  accessMode: SyncAccessMode,
+  continuation: boolean,
+  batchSize = 30,
+) => invoke<SyncSummary>("sync_feed", {
+  profileId,
+  accountId,
+  accessMode,
+  continuation,
+  batchSize,
+});
+
+export const getSyncProgress = (profileId: number, kind: Kind = "post") =>
+  invoke<SyncProgress | null>("get_sync_progress", { profileId, kind });
+
+export const cancelSync = (operationId: string) =>
+  invoke<void>("cancel_sync", { operationId });
 
 // Descarga
 export const downloadProfile = (
@@ -97,20 +120,21 @@ export const exportAvatar = (profileId: number, dest: string) =>
 export const onDownloadProgress = (cb: (p: DownloadProgress) => void) =>
   listen<DownloadProgress>("download:progress", (e) => cb(e.payload)) as Promise<UnlistenFn>;
 
-// Navegador
-export interface BrowserProfile {
-  browser: string;
-  profile: string;
-  cookiesPath: string;
+export interface SyncState {
+  operation_id: string;
+  stage: string;
+  kind?: string;
+  profile_id?: number;
+  publications?: number;
+  assets?: number;
 }
-
-export const listBrowserProfiles = () =>
-  invoke<BrowserProfile[]>("list_browser_profiles");
-
-export const importBrowserAccount = (index: number) =>
-  invoke<AccountInfo>("import_browser_account", { index });
+export const onSyncState = (cb: (state: SyncState) => void) =>
+  listen<SyncState>("sync:state", (event) => cb(event.payload)) as Promise<UnlistenFn>;
 
 // Login asistido (navegador propio de InstaVault + CDP)
 export const loginOpen = () => invoke<void>("login_open");
+export const connectPrivateAccount = () => invoke<void>("connect_private_account");
 export const loginCheck = () => invoke<AccountInfo | null>("login_check");
 export const loginCancel = () => invoke<void>("login_cancel");
+export const disconnectPrivateAccount = (accountId: number) =>
+  invoke<void>("disconnect_private_account", { accountId });

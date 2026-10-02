@@ -697,6 +697,11 @@
 }
 
 .modal {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  translate: -50% -50%;
+  z-index: 101;
   background: var(--surface-2);
   border: 1px solid var(--border-2);
   border-radius: 22px;
@@ -1361,6 +1366,20 @@
 [cmdk-item] svg { width:16px; }
 [cmdk-item][data-selected="true"] { color:var(--text); background:rgba(221,42,123,.13); }
 [cmdk-empty] { padding:26px; text-align:center; color:var(--text-3); }
+
+.privacy-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px solid rgba(45, 212, 167, .24);
+  border-radius: var(--r-md);
+  background: rgba(45, 212, 167, .07);
+  color: var(--ok);
+}
+.privacy-banner div { display:grid; gap:3px; }
+.privacy-banner span { color:var(--text-2); font-size:12px; }
 
 @media (max-width: 1050px) {
   .layout { grid-template-columns:220px 1fr; }

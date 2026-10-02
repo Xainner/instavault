@@ -1,4 +1,4 @@
-use super::client::{IgClient, Session};
+use super::client::IgClient;
 use super::models::{DownloadError, DownloadProgress, DownloadSummary, MediaRow};
 use anyhow::Context;
 use std::path::Path;
@@ -28,7 +28,6 @@ struct DownloadedContent {
 /// autoritativo del lote.
 pub async fn download_all<P>(
     ig: &IgClient,
-    session: &Session,
     db: Arc<Mutex<crate::db::Db>>,
     base_dir: &Path,
     username: &str,
@@ -71,7 +70,6 @@ where
     for row in rows {
         let permit = sem.clone().acquire_owned().await?;
         let ig = ig.clone();
-        let session = session.clone();
         let db = db.clone();
         let base_dir = base_dir.to_path_buf();
         let username = username.to_string();
@@ -86,11 +84,17 @@ where
                 .clone()
                 .or_else(|| Some(row.media_id.clone()))
                 .unwrap_or_default();
-            let (ok, err) = match download_one(&ig, &session, &row, &base_dir, &username, job_id).await {
+            let (ok, err) = match download_one(&ig, &row, &base_dir, &username, job_id).await {
                 Ok(content) => {
                     let saved = db.lock().unwrap().store_media_content(
-                        db_id, &content.bytes, &content.mime_type, content.width,
-                        content.height, content.bitrate, content.quality_verified, content.source,
+                        db_id,
+                        &content.bytes,
+                        &content.mime_type,
+                        content.width,
+                        content.height,
+                        content.bitrate,
+                        content.quality_verified,
+                        content.source,
                     );
                     match saved {
                         Ok(()) => (true, None),
@@ -151,7 +155,10 @@ where
         .map(|r| DownloadError {
             media_id: r.media_id.clone(),
             code: r.code.clone(),
-            error: r.error.clone().unwrap_or_else(|| "error desconocido".into()),
+            error: r
+                .error
+                .clone()
+                .unwrap_or_else(|| "error desconocido".into()),
         })
         .collect();
     let ok = results.iter().filter(|r| r.ok).count();
@@ -168,54 +175,54 @@ where
 /// archivo temporal (corrupción por truncado cruzado).
 async fn download_one(
     ig: &IgClient,
-    session: &Session,
     row: &MediaRow,
     base_dir: &Path,
     username: &str,
     job_id: i64,
 ) -> anyhow::Result<DownloadedContent> {
-    let mut url = row.best_url.as_deref().context("sin best_url")?.to_string();
-    let mut width = None;
-    let mut height = None;
-    let mut bitrate = None;
-    let mut quality_verified = false;
-    for attempt in 0..2 {
-        match super::api::fetch_media_info_candidate(ig, session, &row.media_id).await {
-            Ok(Some(fresh)) => {
-                url = fresh.url;
-                width = Some(fresh.width);
-                height = Some(fresh.height);
-                bitrate = (fresh.bitrate > 0).then_some(fresh.bitrate);
-                quality_verified = true;
-                break;
-            }
-            _ if attempt == 0 => tokio::time::sleep(std::time::Duration::from_millis(450)).await,
-            _ => break,
-        }
-    }
+    // La URL fue seleccionada por el proveedor web en la sincronización. El
+    // cliente de descarga sólo contacta la CDN y nunca recibe cookies.
+    let url = row.best_url.as_deref().context("sin best_url")?.to_string();
     let _ = (base_dir, username, job_id);
 
     let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..3 {
+    for attempt in 0..2 {
         let req = ig.http().get(&url);
         match req.send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     last_err = Some(anyhow::anyhow!("HTTP {}", resp.status()));
                 } else {
-                    let mime = resp.headers().get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok()).unwrap_or(
-                            if row.media_type == Some(2) { "video/mp4" } else { "image/jpeg" }
-                        ).split(';').next().unwrap_or("application/octet-stream").to_string();
+                    let mime = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or(if row.media_type == Some(2) {
+                            "video/mp4"
+                        } else {
+                            "image/jpeg"
+                        })
+                        .split(';')
+                        .next()
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
                     match resp.bytes().await {
                         Ok(bytes) => {
                             if bytes.is_empty() {
                                 last_err = Some(anyhow::anyhow!("respuesta vacía"));
                             } else {
                                 return Ok(DownloadedContent {
-                                    bytes: bytes.to_vec(), mime_type: mime, width, height, bitrate,
-                                    quality_verified,
-                                    source: if quality_verified { "fresh_info" } else { "feed_fallback" },
+                                    bytes: bytes.to_vec(),
+                                    mime_type: mime,
+                                    width: row.width,
+                                    height: row.height,
+                                    bitrate: row.bitrate,
+                                    quality_verified: row.quality_verified,
+                                    source: if row.quality_verified {
+                                        "web_response"
+                                    } else {
+                                        "dom_fallback"
+                                    },
                                 });
                             }
                         }

@@ -31,7 +31,7 @@ export function Sidebar({
   const dl = useDownloads();
   const items: { id: View; label: string; icon: React.ReactNode; badge: number }[] = [
     { id: "profiles", label: "Perfiles", icon: <LayoutGrid size={18} />, badge: profileCount },
-    { id: "accounts", label: "Cuentas", icon: <KeyRound size={18} />, badge: accounts.length },
+    { id: "accounts", label: "Acceso privado", icon: <KeyRound size={18} />, badge: accounts.length },
     { id: "about", label: "Acerca de", icon: <Info size={18} />, badge: 0 },
   ];
 
@@ -92,7 +92,7 @@ export function Sidebar({
         {accounts.length === 0 ? (
           <div className="account-empty">
             <ShieldCheck size={15} />
-            Modo público — sin cookies
+            Público · sin sesión
           </div>
         ) : (
           <div className="account-select-row">
@@ -112,7 +112,7 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="side-foot">v1.0.1 · {mediaCount} archivos · <kbd>Ctrl K</kbd></div>
+      <div className="side-foot">v1.0.4 · {mediaCount} archivos · <kbd>Ctrl K</kbd></div>
     </aside>
   );
 }
