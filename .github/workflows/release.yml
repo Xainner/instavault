@@ -16,41 +16,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-      - name: Privacy gate
-        shell: pwsh
-        run: ./scripts/check-release-privacy.ps1
       - name: Install dependencies
         run: npm ci
-      - name: Test frontend
+      - name: Unit and privacy tests
+        run: npm test
+      - name: Typecheck and build
         run: npm run build
-      - name: Test cookie isolation
-        run: node --test scripts/privacy-boundary.test.mjs
-      - name: Test backend
-        working-directory: src-tauri
-        run: cargo test
-      - name: Build signed updater and draft release
-        uses: tauri-apps/tauri-action@v1
+      - name: Package NSIS installer and publish draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: v__VERSION__
-          releaseName: InstaVault v__VERSION__
-          releaseBody: |
-            Actualización estable de InstaVault.
-
-            - Biblioteca privada en SQLite
-            - Descargas en máxima calidad disponible
-            - Modo público aislado y sin cookies; la sesión solo se usa para perfiles privados
-            - Actualizaciones automáticas vía GitHub
-            - Nueva interfaz oscura profesional
-          releaseDraft: true
-          prerelease: false
-          args: --bundles nsis
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Opcional: firma de código de Windows (si se configuran los secretos)
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npx electron-builder --win --x64 --publish always

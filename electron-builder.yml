@@ -1,0 +1,37 @@
+appId: com.xainner.instavault
+productName: InstaVault
+copyright: Copyright © Xainner
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**
+  - package.json
+  - "!**/*.map"
+asar: true
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  artifactName: InstaVault-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  shortcutName: InstaVault
+  uninstallDisplayName: InstaVault
+mac:
+  target: dmg
+  icon: build/icon.png
+  category: public.app-category.photography
+linux:
+  target: AppImage
+  icon: build/icon.png
+  category: Graphics
+publish:
+  provider: github
+  owner: Xainner
+  repo: instavault
+  releaseType: draft

@@ -15,6 +15,7 @@ dist-ssr
 .env.*
 !.env.example
 *.db
+!tests/fixtures/*.db
 *.db-shm
 *.db-wal
 *.sqlite
@@ -41,3 +42,9 @@ dumps/
 *.njsproj
 *.sln
 *.sw?
+
+# Electron
+out
+release
+.vite
+e2e/.artifacts
