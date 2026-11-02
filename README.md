@@ -1,155 +1,118 @@
 <p align="center">
-  <img src="logo.png" alt="InstaVault" width="160" />
+  <img src="logo.png" alt="InstaVault" width="140" />
 </p>
 
 <h1 align="center">InstaVault</h1>
 
 <p align="center">
-  <strong>Archivador privado de perfiles de Instagram.</strong><br/>
-  Publicaciones, stories, highlights y fotos de perfil en máxima calidad,<br/>guardados como BLOB dentro de una biblioteca SQLite local.
+  <strong>Tu cuarto oscuro para Instagram.</strong><br/>
+  Perfiles, publicaciones, reels, stories y highlights en máxima calidad,<br/>guardados en tu equipo y bajo tu control.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Tauri-2-24C8D8?logo=tauri&logoColor=white" alt="Tauri"/>
-  <img src="https://img.shields.io/badge/Rust-estable-DEA584?logo=rust&logoColor=white" alt="Rust"/>
+  <img src="https://img.shields.io/badge/Electron-44-47848F?logo=electron&logoColor=white" alt="Electron"/>
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React"/>
-  <img src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white" alt="TypeScript"/>
-  <img src="https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white" alt="SQLite"/>
+  <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white" alt="TypeScript"/>
+  <img src="https://img.shields.io/badge/SQLite-node%3Asqlite-003B57?logo=sqlite&logoColor=white" alt="SQLite"/>
   <img src="https://img.shields.io/badge/plataforma-Windows%20x64-555" alt="Plataforma"/>
   <img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia"/>
 </p>
 
 ---
 
-## ✨ Características
+## Qué hace
 
-### Cuentas y sesiones
-- **Modo público sin cookies**: buscar, sincronizar y descargar perfiles públicos no lee el llavero ni inicia la sesión de Instagram.
-- **Aislamiento estricto**: la navegación pública usa un perfil temporal descartable sin cuenta. Nunca acepta un `accountId`, consulta el llavero ni cae automáticamente al modo privado.
-- **Sesión privada explícita**: sólo se inicia desde “Acceso privado” en un navegador visible y dedicado. La app no copia sus cookies a Rust ni al cliente HTTP.
-- Las cuentas creadas por versiones anteriores quedan como `reconnect_required`; al reconectar se elimina su credencial legacy del llavero.
-- Abrir la app, la biblioteca o un perfil guardado genera cero tráfico a Instagram.
+- **Archivo de perfiles**: busca un `@usuario` y guarda su perfil, foto, contadores y primeras publicaciones. Favoritos, filtros, orden y vista en lista o en “fotogramas”.
+- **Sincronización por lotes** con reanudación: posts (fotos, videos, carruseles), stories activas y highlights.
+- **Descarga por enlace**, como en los sitios web: pega una publicación, reel, carrusel, story o highlight, elige las piezas y guárdalas en el archivo o directamente en una carpeta.
+- **Revelado en máxima calidad**: elige siempre el mejor candidato (resolución → bitrate → tamaño) y marca si la calidad está verificada.
+- **Visor** a pantalla completa con luz ambiental, zoom, reproductor propio, carruseles, filmstrip, modo proyección e información técnica (dimensiones, bitrate, SHA-256…).
+- **Cola de descargas** con concurrencia configurable, progreso en vivo, reintentos y re-resolución automática de enlaces caducados.
+- **Importación de InstaVault 1.x**: trae perfiles, piezas, favoritos y archivos de la versión Tauri sin tocar la base original.
+- **Actualizaciones automáticas** desde GitHub Releases.
 
-### Perfiles
-- Búsqueda por username mediante un **motor CDP** (Instagram bloquea los clientes HTTP externos; la app navega con un Chrome propio).
-- Datos completos: nombre, bio, seguidores, seguidos, privacidad, foto de perfil en HD (descargada y guardada localmente).
-- **Favoritos** y estadísticas por perfil y por tipo de contenido.
+## Cómo accede a Instagram
 
-### Contenido
-- **Posts**: feed con paginación, carruseles (item por item) y videos.
-- **Stories** activas.
-- **Highlights**: lectura conservadora desde la web, limitada a cinco elementos por acción explícita.
-- **Sincronización explícita**: pulsa Sincronizar para consultar el tipo de contenido elegido. Abrir un perfil solo lee la biblioteca local.
-- Si Instagram exige login para contenido público, la app informa la restricción y no recurre a cookies. Las respuestas HTML, restricciones y sesiones rechazadas se muestran como errores, no como álbumes vacíos.
+| | Modo anónimo | Con tu cuenta |
+|---|---|---|
+| Perfil público y primeras publicaciones | ✅ | ✅ |
+| Publicación, reel o carrusel por enlace | ✅ | ✅ |
+| Paginación profunda de un perfil | hasta que Instagram corte | ✅ |
+| Stories y highlights | — | ✅ |
+| Perfiles privados que sigues | — | ✅ |
 
-### Descargas
-- **Mejor candidato disponible en la página**: fotos por área/ancho/tamaño conocido y videos por área/bitrate/tamaño/ancho. Si Instagram no permite verificarlo se marca `quality_verified=false`.
-- **Download manager**: concurrencia configurable, progreso por ítem y panel de jobs. Las descargas CDN no reciben cookies de Instagram.
-- **Deduplicación por `media_id`** y SHA-256 dentro de SQLite.
-- **Re-descargar** reemplaza el BLOB y **vaciar el álbum** elimina sus BLOB asociados.
-- **Álbum por perfil**: grilla de lo descargado con lightbox. Los bytes permanecen dentro de SQLite y **“Guardar en dispositivo”** exporta una copia al destino que elijas.
-- **Actualizaciones automáticas firmadas** desde GitHub Releases, con comprobación al iniciar y desde “Acerca de”.
+- **Anónimo primero.** Las consultas públicas usan una partición de Chromium en memoria, sin sesión.
+- **Tu cuenta como respaldo.** Si Instagram cierra el modo anónimo, la app pregunta (o lo hace sola, según *Ajustes → Cuando el modo anónimo se bloquea*) antes de usar tu cuenta.
+- **Cada cuenta en su propia sesión aislada.** Inicias sesión en la ventana oficial de Instagram; la sesión vive en una partición persistente de Chromium y nunca se copia, exporta ni guarda en otro sitio. La app sólo comprueba que existe y lee el id numérico del usuario.
+- **Los bytes vienen de la CDN** a través de una partición que nunca inicia sesión: la CDN no recibe cookies de ninguna cuenta.
+- **Sin tráfico de fondo.** Abrir la app o la biblioteca no contacta Instagram; sólo tus acciones explícitas lo hacen, de una en una, con pausas y deteniéndose ante 401/403/429, checkpoints o `feedback_required`.
 
-### Biblioteca local
-- SQLite (modo WAL): perfiles, medios, highlights, jobs y estado de cada descarga, con reintentos de fallidos.
-- Interfaz en español con Tailwind CSS 4, shadcn/ui, Motion, Lucide, Sonner y tema oscuro accesible.
+> Los sitios web que “ven todo sin iniciar sesión” lo consiguen con muchas cuentas y proxies en sus servidores. Una app de escritorio desde tu conexión no puede replicar eso; por eso stories, highlights y perfiles privados requieren tu cuenta.
 
----
+## Instalación
 
-## 🚀 Instalación
+Descarga el instalador `InstaVault-Setup-x.y.z.exe` desde [Releases](https://github.com/Xainner/instavault/releases).
 
-### Requisitos
-- [Rust](https://rustup.rs) (toolchain estable)
-- [Node.js](https://nodejs.org) 18+ (probado con 24)
-- Windows x64
+> **Desde la 1.x (Tauri):** el sistema de actualizaciones cambió, así que la 2.0 se instala a mano una vez. Al abrirla te ofrece importar tu biblioteca anterior. A partir de ahí las actualizaciones son automáticas.
+
+## Desarrollo
+
+Requisitos: Node.js 22+ (Electron 44 trae su propio Node 24 con `node:sqlite`, sin módulos nativos).
 
 ```bash
-# Clonar
-git clone https://github.com/Xainner/instavault.git
-cd instavault
-
-# Dependencias
 npm install
-
-# Desarrollo (hot-reload)
-npm run tauri dev
-
-# Build de producción (instalador NSIS en Windows x64)
-npm run tauri build
+npm run dev        # Electron + Vite con recarga en caliente
+npm test           # Tests unitarios y de privacidad (vitest)
+npm run build      # Typecheck + build de producción en out/
+npm run dist       # Instalador NSIS en release/
 ```
 
-> El binario final queda en `src-tauri/target/release/instavault.exe` y los bundles en `src-tauri/target/release/bundle/`.
+Prueba visual de humo (biblioteca de demostración, sin tráfico a Instagram):
 
-### Primeros pasos
-1. **Perfiles** → buscá un username en modo público; no necesitas configurar una cuenta.
-2. **Acceso privado** → conecta el navegador dedicado únicamente si quieres acceder a contenido privado autorizado.
-3. **Descargar pendientes** → fotos, videos y avatares se guardan como BLOB dentro de `%APPDATA%/com.xainner.instavault/instakeeper.db`.
-4. **Álbum** → mira lo descargado, expórtalo con “Guardar en dispositivo” o vuelve a descargarlo en máxima calidad.
+```bash
+npm run build && xvfb-run -a npm run e2e   # capturas en e2e/.artifacts/
+```
 
----
-
-## 🏗️ Arquitectura
+## Arquitectura
 
 ```
-src-tauri/
-├── src/
-│   ├── lib.rs               # Arranque, plugins (dialog/opener) y registro de comandos
-│   ├── commands.rs          # Comandos IPC expuestos al frontend
-│   ├── creds.rs             # Limpieza de credenciales legacy del keyring
-│   ├── db.rs                # Capa SQLite: esquema, CRUD, jobs y stats (con tests)
-│   └── instagram/
-│       ├── client.rs        # Cliente sin estado para URLs CDN seleccionadas
-│       ├── api.rs           # Selección determinista del mejor candidato
-│       ├── provider.rs      # Proveedores web público y privado aislados
-│       ├── models.rs        # DTOs de la API + modelos de BD
-│       ├── cdp_login.rs     # Motor CDP: Chrome propio, login asistido, navegación,
-│       │                    #   captura de respuestas y fallback DOM
-│       └── download.rs      # Pipeline BLOB: concurrencia, hash y progreso
 src/
-├── App.tsx                  # Shell local: vistas y estadísticas
-├── components/
-│   ├── Sidebar.tsx          # Navegación, logo y badge de descargas activas
-│   ├── AccountsView.tsx     # Conexión privada mediante navegador dedicado
-│   ├── ProfilesView.tsx     # Biblioteca de perfiles, búsqueda y favoritos
-│   ├── MediaDetail.tsx      # Explorador: pestañas, grilla, lightbox, álbum
-│   ├── Downloads.tsx        # Download manager (jobs, progreso, provider global)
-│   ├── Toasts.tsx           # Notificaciones no intrusivas
-│   └── Modal.tsx            # Diálogos de confirmación
-├── lib/api.ts               # Wrapper tipado del IPC (invoke)
-└── types.ts                 # Tipos compartidos frontend ↔ backend
+├── main/                     Proceso principal (Node)
+│   ├── index.ts              Ventana, protocolo, ciclo de vida
+│   ├── ipc.ts                API IPC tipada y validada con zod
+│   ├── db/                   SQLite (sólo metadatos) y migraciones
+│   ├── vault/                Almacén por SHA-256 + protocolo vault:// con Range
+│   ├── ig/
+│   │   ├── bridge.ts         Ventana oculta por partición: fetch same-origin y captura CDP interna
+│   │   ├── service.ts        Búsquedas, sincronización, enlaces y re-resolución
+│   │   ├── parse.ts          Normaliza respuestas GraphQL, API v1, embed y DOM
+│   │   ├── accounts.ts       Login en ventana oficial, una partición por cuenta
+│   │   └── url.ts            Enlaces de Instagram y shortcode → id
+│   ├── downloads/manager.ts  Cola, concurrencia, progreso, reintentos
+│   ├── legacy/               Importador de InstaVault 1.x
+│   └── updater.ts            electron-updater (GitHub Releases)
+├── preload/                  contextBridge (sandbox + aislamiento de contexto)
+├── shared/                   Contrato IPC y tipos
+└── renderer/                 React 19 · Tailwind 4 · Motion · cmdk · Radix
 ```
 
-### Notas de ingeniería
-- **CDP (Chrome DevTools Protocol)**: la ruta pública levanta un navegador temporal sin cuenta; la privada usa un perfil dedicado y visible. Se capturan sólo los JSON que la web produce y un resumen DOM sin secretos.
-- **Límites**: la compatibilidad con perfiles arbitrarios depende de la web no oficial de Instagram. Un bloqueo público se informa y nunca activa una sesión privada por sí solo.
-- **Avatares**: se guardan durante una búsqueda explícita y después se sirven exclusivamente desde SQLite.
-- **Datos**: `%APPDATA%/com.xainner.instavault/instakeeper.db` (SQLite WAL). No se crean archivos de medios independientes salvo al exportarlos.
+**Datos** en `%APPDATA%/InstaVault/`: `library.db` (SQLite WAL) y `vault/` con los archivos nombrados por su SHA-256 (sin duplicados). “Guardar en el equipo” exporta copias con nombres legibles y verifica el hash.
 
----
+## Comprobación manual en Windows
 
-## 🗺️ Roadmap
+Este repositorio se prueba de forma automática sin red hacia Instagram. Antes de publicar, comprueba en Windows:
 
-- [x] Modo público anónimo y sesión privada dedicada
-- [x] Perfiles con búsqueda CDP, favoritos y stats
-- [x] Posts (carruseles/videos), stories y highlights
-- [x] Persistencia SQLite con deduplicación y reintentos
-- [x] Download manager con progreso y jobs
-- [x] Selección del mejor candidato disponible y trazabilidad de calidad
-- [x] Álbum por perfil, re-descarga y “Guardar en este equipo”
-- [ ] Adaptadores para futuros cambios de la web de Instagram
-- [ ] Exportación/búsqueda avanzada de la biblioteca local
-- [ ] Publicaciones guardadas y etiquetadas
+1. Buscar un perfil público → aparecen perfil, foto y primeras publicaciones.
+2. Sincronizar → continuar hasta que Instagram limite; “Continuar con cuenta”.
+3. Pegar enlaces de publicación, reel y carrusel en modo anónimo.
+4. Conectar una cuenta → stories, highlights y un perfil privado que sigas.
+5. Revelar pendientes, abrir el visor y guardar en el equipo.
+6. Importar la biblioteca 1.x y verificar conteos.
 
-## ⚖️ Aviso legal
+## Aviso legal
 
-InstaVault se desarrolla con fines **personales y educativos** para archivar contenido al que ya tenés acceso. La descarga automatizada puede violar los [Términos de uso de Instagram](https://help.instagram.com/581066165581870) y los derechos de propiedad intelectual de los creadores. Usá esta herramienta bajo tu propia responsabilidad, preferentemente con tu propia cuenta y respetando a los autores.
+InstaVault es una herramienta **personal y educativa** para archivar contenido al que ya tienes acceso. La descarga automatizada puede infringir los [Términos de uso de Instagram](https://help.instagram.com/581066165581870) y los derechos de autor de terceros: úsala con responsabilidad y respeta a los autores. Las ilustraciones de la interfaz se generaron con Rinari Visual Lab bajo licencia no comercial.
 
-## 📄 Licencia
+## Licencia
 
 [MIT](LICENSE)
-
----
-
-<p align="center">
-  Hecho con <a href="https://www.rust-lang.org">Rust</a> y <a href="https://tauri.app">Tauri</a>.
-</p>
