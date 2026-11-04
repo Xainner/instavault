@@ -56,6 +56,11 @@ export const SNAPSHOT_SCRIPT = `(() => ({
   }))
 }))()`;
 
+/** Datos que la página trae incrustados (SSR) en lugar de pedirlos por la red. */
+export const SSR_SCRIPT = `(() => Array.from(document.querySelectorAll('script[type="application/json"]'))
+  .map(s => s.textContent || "")
+  .filter(t => t.includes("__bbox") && t.includes('"result"')))()`;
+
 /** Desplaza la cuadrícula del perfil y devuelve los shortcodes visibles. */
 export const SCROLL_SCRIPT = `(() => {
   const root = document.querySelector("main") || document;

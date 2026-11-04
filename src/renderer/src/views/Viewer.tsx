@@ -182,7 +182,7 @@ export function Viewer({ profile, pubs, index, onIndex, onClose, onDownload }: P
       </div>
 
       {/* escenario */}
-      <div className="grid min-h-0" style={{ gridTemplateColumns: info ? "1fr 360px" : "1fr" }}>
+      <div className="grid min-h-0" style={{ gridTemplateColumns: info ? "minmax(0, 1fr) 360px" : "minmax(0, 1fr)", gridTemplateRows: "minmax(0, 1fr)" }}>
         <div className="viewer-stage px-20 py-4" onWheel={onWheel}>
           <AnimatePresence mode="wait">
             <motion.div
@@ -191,7 +191,7 @@ export function Viewer({ profile, pubs, index, onIndex, onClose, onDownload }: P
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.99 }}
               transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
-              className="relative grid h-full w-full place-items-center"
+              className="viewer-fit"
             >
               {item.status === "downloaded" && item.contentUrl ? (
                 item.mediaType === 2 ? (
@@ -366,7 +366,7 @@ function VideoPlayer({ src, poster, videoRef }: { src: string; poster: string | 
   const [rate, setRate] = useState(1);
   const pct = duration ? (time / duration) * 100 : 0;
   return (
-    <div className="relative grid h-full w-full place-items-center">
+    <div className="viewer-fit">
       <video
         ref={videoRef}
         src={src}
