@@ -20,17 +20,17 @@ dist-ssr
 *.db-wal
 *.sqlite
 *.sqlite3
-downloads/
-avatars/
+/downloads/
+/avatars/
 *.key
 *.pem
 *.pfx
 *.p12
 *.sig
 *.cookies
-browser-profile/
-backups/
-dumps/
+/browser-profile/
+/backups/
+/dumps/
 
 # Editor directories and files
 .vscode/*
