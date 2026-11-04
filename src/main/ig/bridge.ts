@@ -3,7 +3,7 @@ import type { AccessMode } from "@shared/types";
 import { VaultError, cancelled } from "../errors";
 import { classifyJson, parseJsonLoose, type RawResponse } from "./classify";
 import { recordPublicationCodes, type PageSnapshot } from "./parse";
-import { CURRENT_USER_SCRIPT, SCROLL_SCRIPT, SNAPSHOT_SCRIPT, fetchScript } from "./scripts";
+import { CURRENT_USER_SCRIPT, SCROLL_SCRIPT, SNAPSHOT_SCRIPT, SSR_SCRIPT, fetchScript } from "./scripts";
 
 const ORIGIN = "https://www.instagram.com";
 
@@ -32,6 +32,8 @@ export interface CaptureOptions {
   /** Shortcode a partir del cual empezar a contar (reanudación). */
   checkpoint?: string | null;
   timeoutMs?: number;
+  /** Tope de desplazamientos (por defecto 140). */
+  maxScrolls?: number;
   isCancelled?: () => boolean;
 }
 
@@ -218,11 +220,18 @@ export class IgBridge {
         await dbg.sendCommand("Network.enable", { maxTotalBufferSize: 50_000_000 });
         await this.load(wc, url, 35_000);
         lastActivity = Date.now();
-        const maxScrolls = options.batchSize > 0 ? 140 : 0;
+        const maxScrolls = options.batchSize > 0 ? (options.maxScrolls ?? 140) : 0;
         // Espera inicial a que la página emita sus respuestas.
         while (Date.now() < deadline && Date.now() - lastActivity < 1800) {
           if (options.isCancelled?.()) throw cancelled();
           await sleep(250);
+        }
+        // Sin sesión, el perfil y la primera cuadrícula vienen incrustados en el HTML.
+        try {
+          const ssr = (await wc.executeJavaScript(SSR_SCRIPT, true)) as string[];
+          for (const block of ssr) payloads.push(...parseJsonLoose(block));
+        } catch {
+          /* la página no trae datos incrustados */
         }
         for (let scroll = 0; scroll < maxScrolls && Date.now() < deadline; scroll++) {
           if (options.isCancelled?.()) throw cancelled();

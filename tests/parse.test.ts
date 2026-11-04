@@ -5,8 +5,12 @@ import {
   collectMedia,
   detectDenial,
   extractMobileItem,
+  findHighlights,
   findProfile,
+  findReels,
+  findUser,
   paginationHasMore,
+  parseJsonScripts,
   parseCompactNumber,
   parseDescriptionCounts,
   parseEmbedHtml,
@@ -19,6 +23,7 @@ import {
   snapshotIndicatesEmpty,
   snapshotIndicatesLoginWall,
   timelineFromProfileInfo,
+  userTimelineHasMore,
 } from "../src/main/ig/parse";
 import type { ExtractedMedia } from "../src/main/ig/types";
 
@@ -164,6 +169,59 @@ describe("perfiles y páginas", () => {
   it("encuentra el perfil en GraphQL anidado", () => {
     const user = findProfile({ data: { user: { id: "7", username: "Test.User", full_name: "Test", is_private: false, follower_count: 12 } } }, "test.user");
     expect(user).toMatchObject({ igId: "7", username: "test.user", followers: 12 });
+  });
+
+  it("usa el pk y no el id de FB de las respuestas GraphQL nuevas", () => {
+    const user = findProfile(
+      { data: { xig_user_by_username: { pk: "484949992", id: "17841400659767577", username: "fio", profile_pic_url: "p", follower_count: 5 } } },
+      "fio",
+    );
+    expect(user?.igId).toBe("484949992");
+  });
+
+  it("elige la copia más completa del usuario entre varias respuestas", () => {
+    const payloads = [
+      { items: [{ code: "A", media_type: 1, user: { pk: "9", username: "fio", profile_pic_url: "small", is_private: false } }] },
+      { data: { user: { pk: "9", username: "fio", full_name: "Fio", profile_pic_url: "p", follower_count: 87132, media_count: 897, biography: "hey", is_private: false } } },
+    ];
+    expect(findUser(payloads, "fio")).toMatchObject({ follower_count: 87132, media_count: 897 });
+  });
+
+  it("lee el usuario incrustado en el HTML del perfil", () => {
+    const blob = { require: [[{ __bbox: { result: { data: { xig_user_by_username: { pk: "1", username: "fio", full_name: "Fio", profile_pic_url: "p", is_private: false } } } } }]] };
+    const html = `<html><script type="application/json" data-sjs>${JSON.stringify(blob)}</script><script type="application/json">{oops</script></html>`;
+    const scripts = parseJsonScripts(html);
+    expect(scripts).toHaveLength(1);
+    expect(findProfile(scripts, "fio")).toMatchObject({ igId: "1", fullName: "Fio", isPrivate: false });
+  });
+
+  it("lee stories y highlights incrustados en el HTML del visor", () => {
+    const item = (pk: string) => ({ pk, id: `${pk}_9`, code: `C${pk}`, media_type: 1, taken_at: 1, image_versions2: { candidates: [{ url: `u${pk}`, width: 1080, height: 1920 }] } });
+    const user = { pk: "9", username: "fio" };
+    const stories = { data: { xdt_api__v1__feed__reels_media: { reels_media: [{ id: "9", reel_type: "user_reel", user, items: [item("1"), item("2")] }] } } };
+    const highlight = { data: { xdt_api__v1__feed__reels_media__connection: { edges: [{ node: { id: "highlight:77", reel_type: "highlight_reel", title: "F", user, items: [item("3")] } }] } } };
+    const story = parseReels({ reels_media: findReels(stories) }, "story");
+    expect(story.map((m) => m.mediaId)).toEqual(["st_1", "st_2"]);
+    const hl = parseReels({ reels_media: findReels(highlight) }, "highlight");
+    expect(hl).toHaveLength(1);
+    expect(hl[0]).toMatchObject({ mediaId: "hl_3", highlightId: "77", width: 1080 });
+  });
+
+  it("lee la bandeja de highlights de GraphQL y descarta los de otras cuentas", () => {
+    const node = (id: string, username: string) => ({ node: { id: `highlight:${id}`, title: `T${id}`, cover_media: { cropped_image_version: { url: `c${id}` } }, user: { username } } });
+    const payload = { data: { highlights: { edges: [node("1", "fio"), node("2", "fio"), node("3", "otra")] } } };
+    expect(findHighlights(payload, "fio")).toEqual([
+      { highlightId: "1", title: "T1", coverUrl: "c1", itemCount: 0 },
+      { highlightId: "2", title: "T2", coverUrl: "c2", itemCount: 0 },
+    ]);
+  });
+
+  it("toma la paginación de la cuadrícula e ignora el feed de inicio", () => {
+    const grid = (more: boolean) => ({ data: { xdt_api__v1__feed__user_timeline_graphql_connection: { edges: [], page_info: { has_next_page: more } } } });
+    const home = { data: { xdt_api__v1__feed__timeline__connection: { page_info: { has_next_page: true } } } };
+    expect(userTimelineHasMore([grid(true), home])).toBe(true);
+    expect(userTimelineHasMore([grid(true), grid(false), home])).toBe(false);
+    expect(userTimelineHasMore([home])).toBeNull();
   });
 
   it("lee contadores de la meta description", () => {

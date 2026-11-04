@@ -11,10 +11,12 @@ import {
   dedupe,
   detectDenial,
   extractMobileItem,
-  findProfile,
+  findUser,
   paginationHasMore,
   parseEmbedHtml,
-  parseHighlightsTray,
+  findHighlights,
+  findReels,
+  parseJsonScripts,
   parseReels,
   profileFromSnapshot,
   profileFromUser,
@@ -22,7 +24,7 @@ import {
   sanitizeUsername,
   snapshotIndicatesEmpty,
   snapshotIndicatesLoginWall,
-  timelineFromProfileInfo,
+  userTimelineHasMore,
   type PageSnapshot,
 } from "./parse";
 import type { ExtractedMedia, ExtractedProfile } from "./types";
@@ -30,7 +32,6 @@ import { parseInstagramUrl, shortcodeToMediaId } from "./url";
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface ServiceHooks {
   activity(activity: RemoteActivity | null): void;
@@ -49,6 +50,11 @@ interface StoredResolution {
   ownerProfile: ExtractedProfile | null;
   accountId: number | null;
   createdAt: number;
+}
+
+function notFollowed(user: Obj): boolean {
+  if (user.followed_by_viewer === false) return true;
+  return isObj(user.friendship_status) && user.friendship_status.following === false;
 }
 
 function snapshotMatchesProfile(snapshot: PageSnapshot, username: string): boolean {
@@ -148,31 +154,47 @@ export class InstagramService {
   }
 
   // ------------------------------------------------------------- perfiles
-  private async profileInfo(bridge: IgBridge, username: string): Promise<{ profile: ExtractedProfile; raw: Obj; user: Obj }> {
-    const raw = await bridge.apiGet(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
-    const data = isObj(raw.data) ? raw.data : null;
-    const user = data && isObj(data.user) ? data.user : null;
-    if (!user) throw new VaultError("not_found", `Instagram no encontró a @${username}.`);
-    const profile = profileFromUser(user, username);
-    if (!profile) throw new VaultError("provider_changed", "Instagram devolvió un perfil sin nombre de usuario.");
-    return { profile, raw, user };
+  /*
+   * Instagram retiró /api/v1/users/web_profile_info/ y /api/v1/feed/user/
+   * (404 con y sin sesión). Ahora el perfil y la cuadrícula se leen como lo
+   * hace la web: sin sesión vienen incrustados en el HTML; con sesión, la
+   * página los pide por GraphQL al cargarse y al desplazarse.
+   */
+
+  /** Navega el perfil, desplaza la cuadrícula y extrae perfil y publicaciones. */
+  private async readGrid(
+    bridge: IgBridge,
+    username: string,
+    opts: { need: number; checkpoint: string | null; ctx?: OperationContext; timeoutMs?: number; maxScrolls?: number },
+  ) {
+    const capture = await bridge.capture(`https://www.instagram.com/${username}/`, {
+      batchSize: opts.need,
+      checkpoint: opts.checkpoint,
+      isCancelled: opts.ctx?.isCancelled,
+      timeoutMs: opts.timeoutMs,
+      maxScrolls: opts.maxScrolls,
+    });
+    const user = findUser(capture.payloads, username);
+    const profile = (user ? profileFromUser(user, username) : null) ?? profileFromSnapshot(capture.snapshot, username);
+    const media = retainGridMedia(
+      dedupe([...collectMedia(capture.payloads, { kind: "post", username }), ...collectMedia(capture.gridItems, { kind: "post" })]),
+      capture.publicationCodes,
+    );
+    return { capture, user, profile, media };
   }
 
-  private async profileFromPage(bridge: IgBridge, username: string, ctx: OperationContext): Promise<ExtractedProfile> {
-    const capture = await bridge.capture(`https://www.instagram.com/${username}/`, { batchSize: 0, isCancelled: ctx.isCancelled });
-    const denial = detectDenial(capture.snapshot);
-    if (denial) throw new VaultError(denial.code, denial.message, { retryable: denial.code === "rate_limited" });
-    for (const payload of capture.payloads) {
-      const found = findProfile(payload, username);
-      if (found) return found;
-    }
-    const fromDom = profileFromSnapshot(capture.snapshot, username);
-    if (fromDom) return fromDom;
+  private profileUnreadable(bridge: IgBridge, snapshot: PageSnapshot): VaultError {
+    const denial = detectDenial(snapshot);
+    if (denial) return new VaultError(denial.code, denial.message, { retryable: denial.code === "rate_limited" });
     if (bridge.access === "public") {
-      throw new VaultError("public_blocked", "Instagram no entregó el perfil sin iniciar sesión. No se usó ninguna cuenta.", { canUseAccount: true });
+      return new VaultError("public_blocked", "Instagram no entregó el perfil sin iniciar sesión. No se usó ninguna cuenta.", { canUseAccount: true });
     }
-    throw new VaultError("provider_changed", "Instagram cambió la página y no se pudo leer el perfil.");
+    if (snapshotIndicatesLoginWall(snapshot)) {
+      return new VaultError("private_login_required", "La sesión de la cuenta expiró o fue rechazada. Vuelve a conectarla.");
+    }
+    return new VaultError("provider_changed", "Instagram cambió la página y no se pudo leer el perfil.");
   }
+
 
   private async saveAvatar(profileId: number, url: string | null) {
     if (!url) return;
@@ -191,32 +213,26 @@ export class InstagramService {
     return this.exclusive(`Buscando @${username}`, null, async (ctx) => {
       const bridge = this.bridge(access, accountId);
       ctx.stage(access === "public" ? "Consultando en modo anónimo" : "Consultando con tu cuenta");
-      let profile: ExtractedProfile;
-      let timeline: ReturnType<typeof timelineFromProfileInfo> | null = null;
-      try {
-        const info = await this.profileInfo(bridge, username);
-        profile = info.profile;
-        timeline = timelineFromProfileInfo(info.raw);
-      } catch (error) {
-        if (!(error instanceof VaultError) || !["public_blocked", "provider_changed", "private_login_required"].includes(error.code)) throw error;
-        if (error.code === "private_login_required" && access === "account") throw error;
-        ctx.stage("Leyendo la página del perfil");
-        profile = await this.profileFromPage(bridge, username, ctx);
-      }
+      const grid = await this.readGrid(bridge, username, { need: 12, checkpoint: null, ctx });
+      const profile = grid.profile;
+      if (!profile) throw this.profileUnreadable(bridge, grid.capture.snapshot);
       if (ctx.isCancelled()) throw cancelled();
       const profileId = this.repo.upsertProfile(profile);
       ctx.stage("Guardando foto de perfil");
       await this.saveAvatar(profileId, profile.profilePicUrl);
-      if (timeline && timeline.media.length) {
-        const result = this.repo.upsertMedia(profileId, timeline.media);
-        this.repo.saveSync({
+      if (grid.media.length) {
+        const result = this.repo.upsertMedia(profileId, grid.media);
+        const codes = grid.capture.publicationCodes;
+        const hasMore = userTimelineHasMore(grid.capture.payloads) ?? paginationHasMore(grid.capture.payloads);
+        // Volver a buscar un perfil ya archivado no debe borrar el avance de su sincronización.
+        if (!this.repo.getSync(profileId, "post")) this.repo.saveSync({
           profileId,
           kind: "post",
           access,
-          cursor: access === "public" ? timeline.endCursor : null,
-          lastCode: timeline.codes.at(-1) ?? null,
-          seen: timeline.codes.length,
-          status: timeline.hasNext === false ? "complete" : "more_available",
+          cursor: null,
+          lastCode: codes.at(-1) ?? null,
+          seen: codes.length,
+          status: hasMore === false && codes.length < 12 ? "complete" : "more_available",
           stopReason: null,
         });
         ctx.stage("Revelando miniaturas");
@@ -270,129 +286,70 @@ export class InstagramService {
     const batch = Math.max(6, Math.min(req.batchSize ?? this.repo.getSettings().postsBatchSize, 5000));
     const prior = req.continuation ? this.repo.getSync(req.profileId, "post") : null;
     const bridge = this.bridge(req.access, req.accountId);
-    const media: ExtractedMedia[] = [];
-    const codes: string[] = [];
+    const anonymous = req.access === "public";
     let status: SyncStatus = "complete";
     let stopReason: string | null = null;
-    let cursor: string | null = null;
+    const cursor: string | null = null;
 
-    if (req.access === "account") {
-      ctx.stage("Leyendo el perfil con tu cuenta");
-      const info = await this.profileInfo(bridge, row.username);
-      this.repo.upsertProfile(info.profile);
-      if (info.profile.isPrivate && info.user.followed_by_viewer === false) {
-        throw new VaultError("private_not_followed", `@${row.username} es privada y tu cuenta no la sigue.`);
-      }
-      const igId = info.profile.igId;
-      if (!igId) throw new VaultError("provider_changed", "Instagram no devolvió el identificador del perfil.");
-      cursor = prior?.access === "account" ? prior.cursor : null;
-      let skipUntil = prior && prior.access === "public" ? prior.lastCode : null;
-      let pages = 0;
-      for (;;) {
-        if (ctx.isCancelled()) {
-          status = "cancelled";
-          stopReason = "Sincronización cancelada.";
-          break;
-        }
-        ctx.stage(`Leyendo publicaciones · ${codes.length}/${batch === 5000 ? "todas" : batch}`);
-        const json = await bridge.apiGet(`/api/v1/feed/user/${igId}/?count=33${cursor ? `&max_id=${encodeURIComponent(cursor)}` : ""}`);
-        pages++;
-        const items = Array.isArray(json.items) ? json.items.filter(isObj) : [];
-        for (const item of items) {
-          const code = typeof item.code === "string" ? item.code : null;
-          if (skipUntil) {
-            if (code === skipUntil) skipUntil = null;
-            continue;
-          }
-          media.push(...extractMobileItem(item, { kind: "post" }));
-          if (code) codes.push(code);
-        }
-        cursor = typeof json.next_max_id === "string" ? json.next_max_id : null;
-        const more = json.more_available === true && cursor !== null;
-        if (!more) {
-          status = "complete";
-          break;
-        }
-        if (codes.length >= batch) {
-          status = "more_available";
-          break;
-        }
-        if (pages > 400) {
-          status = "more_available";
-          break;
-        }
-        await sleep(1200 + Math.random() * 1300);
-      }
-    } else {
-      if (row.isPrivate) {
+    if (anonymous && row.isPrivate) {
+      throw new VaultError("private_login_required", `@${row.username} es privada: usa una cuenta que la siga.`, { canUseAccount: true });
+    }
+    // Para reanudar hay que volver a desplazarse por lo ya visto hasta el checkpoint.
+    const checkpoint = req.continuation ? (prior?.lastCode ?? null) : null;
+    const behind = checkpoint ? (prior?.seen ?? 0) : 0;
+    ctx.stage(anonymous ? "Recorriendo la cuadrícula en modo anónimo" : "Recorriendo la cuadrícula con tu cuenta");
+    const grid = await this.readGrid(bridge, row.username, {
+      need: batch,
+      checkpoint,
+      ctx,
+      ...(anonymous ? {} : { timeoutMs: Math.min(900_000, 30_000 + (batch + behind) * 500), maxScrolls: Math.min(800, Math.ceil((batch + behind) / 6) + 20) }),
+    });
+    const { capture } = grid;
+    const denial = detectDenial(capture.snapshot);
+    const onProfile = snapshotMatchesProfile(capture.snapshot, row.username);
+    if (grid.profile && onProfile) this.repo.upsertProfile(grid.profile);
+    const codes = capture.publicationCodes;
+    const media = grid.media;
+
+    if (grid.profile?.isPrivate && !codes.length) {
+      if (anonymous) {
         throw new VaultError("private_login_required", `@${row.username} es privada: usa una cuenta que la siga.`, { canUseAccount: true });
       }
-      let hasNext: boolean | null = null;
-      let apiFailed = false;
-      if (!req.continuation) {
-        ctx.stage("Leyendo el perfil en modo anónimo");
-        try {
-          const info = await this.profileInfo(bridge, row.username);
-          this.repo.upsertProfile(info.profile);
-          if (info.profile.isPrivate) {
-            throw new VaultError("private_login_required", `@${row.username} es privada: usa una cuenta que la siga.`, { canUseAccount: true });
-          }
-          const timeline = timelineFromProfileInfo(info.raw);
-          media.push(...timeline.media);
-          codes.push(...timeline.codes);
-          hasNext = timeline.hasNext;
-          cursor = timeline.endCursor;
-        } catch (error) {
-          if (!(error instanceof VaultError) || !["public_blocked", "provider_changed"].includes(error.code)) throw error;
-          apiFailed = true;
-        }
+      if (grid.user && notFollowed(grid.user)) throw new VaultError("private_not_followed", `@${row.username} es privada y tu cuenta no la sigue.`);
+    }
+    if (!onProfile && !media.length) {
+      if (denial) throw new VaultError(denial.code, denial.message, { retryable: denial.code === "rate_limited" });
+      if (anonymous) {
+        throw new VaultError("public_blocked", "Instagram no dejó ver el perfil sin iniciar sesión. No se usó ninguna cuenta.", { canUseAccount: true });
       }
-      const need = apiFailed || req.continuation ? batch : batch - codes.length;
-      if (need > 0 && hasNext !== false) {
-        ctx.stage("Recorriendo la cuadrícula");
-        const checkpoint = req.continuation ? (prior?.lastCode ?? null) : (codes.at(-1) ?? null);
-        const capture = await bridge.capture(`https://www.instagram.com/${row.username}/`, {
-          batchSize: need,
-          checkpoint,
-          isCancelled: ctx.isCancelled,
-        });
-        const denial = detectDenial(capture.snapshot);
-        const onProfile = snapshotMatchesProfile(capture.snapshot, row.username);
-        if (!onProfile && !media.length) {
-          throw new VaultError("public_blocked", "Instagram no dejó ver el perfil sin iniciar sesión. No se usó ninguna cuenta.", { canUseAccount: true });
-        }
-        const found = retainGridMedia(
-          dedupe([...collectMedia(capture.payloads, { kind: "post", username: row.username }), ...collectMedia(capture.gridItems, { kind: "post" })]),
-          capture.publicationCodes,
-        );
-        media.push(...found);
-        codes.push(...capture.publicationCodes);
-        if (ctx.isCancelled()) {
-          status = "cancelled";
-          stopReason = "Sincronización cancelada.";
-        } else if (denial && denial.code === "challenge_required") {
-          status = "challenge_required";
-          stopReason = denial.message;
-        } else if ((denial && denial.code === "rate_limited") || capture.httpStatus === 429) {
-          status = "rate_limited";
-          stopReason = "Instagram limitó temporalmente las consultas.";
-        } else if (capture.httpStatus === 401 || capture.httpStatus === 403) {
-          status = "anonymous_limit";
-          stopReason = "Instagram pide iniciar sesión para seguir viendo este perfil.";
-        } else if (snapshotIndicatesEmpty(capture.snapshot) || paginationHasMore(capture.payloads) === false) {
-          status = "complete";
-        } else if (capture.publicationCodes.length >= need) {
-          status = "more_available";
-        } else if (snapshotIndicatesLoginWall(capture.snapshot) || capture.stalled || !onProfile) {
-          status = "anonymous_limit";
-          stopReason = `Instagram limitó el modo anónimo tras ${codes.length} publicaciones.`;
-        } else {
-          status = "stalled";
-          stopReason = "No se pudo confirmar el final del perfil; el avance quedó guardado.";
-        }
-      } else {
-        status = hasNext === false ? "complete" : "more_available";
-      }
+      throw new VaultError("private_login_required", "La sesión de la cuenta expiró o fue rechazada. Vuelve a conectarla.");
+    }
+
+    const hasMore = userTimelineHasMore(capture.payloads) ?? paginationHasMore(capture.payloads);
+    const seenTotal = behind + codes.length;
+    const knownTotal = grid.profile?.mediaCount ?? row.mediaCount ?? null;
+    if (ctx.isCancelled()) {
+      status = "cancelled";
+      stopReason = "Sincronización cancelada.";
+    } else if (denial && denial.code === "challenge_required") {
+      status = "challenge_required";
+      stopReason = denial.message;
+    } else if ((denial && denial.code === "rate_limited") || capture.httpStatus === 429) {
+      status = "rate_limited";
+      stopReason = "Instagram limitó temporalmente las consultas.";
+    } else if (codes.length >= batch) {
+      status = "more_available";
+    } else if (snapshotIndicatesEmpty(capture.snapshot) || hasMore === false || (knownTotal !== null && seenTotal >= knownTotal)) {
+      status = "complete";
+    } else if (anonymous && (capture.httpStatus === 401 || capture.httpStatus === 403 || snapshotIndicatesLoginWall(capture.snapshot) || capture.stalled || !onProfile)) {
+      status = "anonymous_limit";
+      stopReason = `Instagram limitó el modo anónimo tras ${seenTotal} publicaciones.`;
+    } else if (checkpoint && !capture.checkpointReached) {
+      status = "stalled";
+      stopReason = "No se llegó al punto donde quedó la sincronización anterior; vuelve a intentarlo.";
+    } else {
+      status = "stalled";
+      stopReason = "No se pudo confirmar el final del perfil; el avance quedó guardado.";
     }
 
     ctx.stage("Guardando en la biblioteca");
@@ -429,38 +386,61 @@ export class InstagramService {
     };
   }
 
-  private async userIdFor(bridge: IgBridge, row: ExtractedProfile & { id: number }): Promise<string> {
-    if (row.igId) return row.igId;
-    const info = await this.profileInfo(bridge, row.username);
-    this.repo.upsertProfile(info.profile);
-    if (!info.profile.igId) throw new VaultError("provider_changed", "Instagram no devolvió el identificador del perfil.");
-    return info.profile.igId;
+  /*
+   * Stories y highlights: /api/v1/feed/reels_media/ y highlights_tray ya no
+   * responden. El HTML del visor (/stories/…) trae los reels incrustados. Se
+   * pide sólo el HTML, sin ejecutar el visor ni pulsar «Ver historia»: así no
+   * se marca nada como visto (la web lo hace con PolarisStoriesV3SeenMutation).
+   */
+  private async storyPage(bridge: IgBridge, path: string): Promise<Obj[]> {
+    const page = await bridge.fetchText(path);
+    if (page.status === 0) throw new VaultError("network", `No se pudo contactar con Instagram (${page.body || "sin respuesta"}).`, { retryable: true });
+    if (page.status === 429) throw new VaultError("rate_limited", "Instagram limitó temporalmente las consultas. Espera unos minutos.", { retryable: true });
+    if (page.url.includes("/challenge/")) throw new VaultError("challenge_required", "Instagram pide una verificación de seguridad. Ábrela en la ventana de la cuenta.");
+    if (page.url.includes("/accounts/login")) throw new VaultError("private_login_required", "La sesión de la cuenta expiró o fue rechazada. Vuelve a conectarla.");
+    if (page.status === 404) return [];
+    if (page.status < 200 || page.status >= 300) throw new VaultError("provider_changed", `Respuesta inesperada de Instagram (${page.status}).`);
+    return findReels(parseJsonScripts(page.body));
+  }
+
+  /** Stories activas del perfil (vacío si no tiene). */
+  private async storyMedia(bridge: IgBridge, username: string): Promise<ExtractedMedia[]> {
+    const reels = (await this.storyPage(bridge, `/stories/${encodeURIComponent(username)}/`)).filter(
+      (reel) => isObj(reel.user) && typeof reel.user.username === "string" && reel.user.username.toLowerCase() === username.toLowerCase(),
+    );
+    return parseReels({ reels_media: reels }, "story");
+  }
+
+  private async highlightMedia(bridge: IgBridge, highlightId: string): Promise<ExtractedMedia[]> {
+    const reels = (await this.storyPage(bridge, `/stories/highlights/${encodeURIComponent(highlightId)}/`)).filter((reel) => String(reel.id) === `highlight:${highlightId}`);
+    return parseReels({ reels_media: reels }, "highlight");
   }
 
   private async syncStories(row: ExtractedProfile & { id: number }, req: { profileId: number; accountId?: number | null }, ctx: OperationContext): Promise<SyncResult> {
     const bridge = this.bridge("account", req.accountId);
     ctx.stage("Buscando stories activas");
-    const igId = await this.userIdFor(bridge, row);
-    const json = await bridge.apiGet(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(igId)}`);
-    const items = parseReels(json, "story");
+    const items = await this.storyMedia(bridge, row.username);
     return this.finishReelSync(row, "story", items, ctx);
   }
 
   private async syncHighlights(row: ExtractedProfile & { id: number }, req: { profileId: number; accountId?: number | null }, ctx: OperationContext): Promise<SyncResult> {
     const bridge = this.bridge("account", req.accountId);
     ctx.stage("Leyendo highlights");
-    const igId = await this.userIdFor(bridge, row);
-    const tray = parseHighlightsTray(await bridge.apiGet(`/api/v1/highlights/${encodeURIComponent(igId)}/highlights_tray/`));
+    // La bandeja llega por GraphQL al abrir el perfil.
+    const grid = await this.readGrid(bridge, row.username, { need: 0, checkpoint: null, ctx });
+    const tray = findHighlights(grid.capture.payloads, row.username);
+    if (!tray.length && !snapshotMatchesProfile(grid.capture.snapshot, row.username)) throw this.profileUnreadable(bridge, grid.capture.snapshot);
+    if (grid.profile) this.repo.upsertProfile(grid.profile);
+    const items: ExtractedMedia[] = [];
+    for (const [i, highlight] of tray.entries()) {
+      if (ctx.isCancelled()) break;
+      ctx.stage(`Highlights ${i + 1}/${tray.length}`);
+      const media = await this.highlightMedia(bridge, highlight.highlightId);
+      if (media.length) highlight.itemCount = media.length;
+      items.push(...media);
+    }
     this.repo.upsertHighlights(req.profileId, tray);
     await this.cacheHighlightCovers(req.profileId);
-    const items: ExtractedMedia[] = [];
-    for (let i = 0; i < tray.length; i += 3) {
-      if (ctx.isCancelled()) break;
-      const group = tray.slice(i, i + 3);
-      ctx.stage(`Highlights ${Math.min(i + 3, tray.length)}/${tray.length}`);
-      const query = group.map((h) => `reel_ids=${encodeURIComponent(`highlight:${h.highlightId}`)}`).join("&");
-      items.push(...parseReels(await bridge.apiGet(`/api/v1/feed/reels_media/?${query}`), "highlight"));
-    }
     return this.finishReelSync(row, "highlight", items, ctx);
   }
 
@@ -553,15 +533,12 @@ export class InstagramService {
         const bridge = this.bridge("account", accountId);
         if (parsed.type === "story") {
           ctx.stage(`Buscando la story de @${parsed.username}`);
-          const info = await this.profileInfo(bridge, parsed.username);
-          const json = await bridge.apiGet(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(info.profile.igId ?? "")}`);
-          media = parseReels(json, "story").filter((m) => m.mediaId === `st_${parsed.storyId}` || m.mediaId.startsWith(`st_${parsed.storyId}_`));
+          media = (await this.storyMedia(bridge, parsed.username)).filter((m) => m.mediaId === `st_${parsed.storyId}` || m.mediaId.startsWith(`st_${parsed.storyId}_`));
           if (!media.length) throw new VaultError("not_found", "La story ya no está disponible (duran 24 horas).");
           owner = parsed.username;
         } else {
           ctx.stage("Leyendo el highlight");
-          const json = await bridge.apiGet(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(`highlight:${parsed.highlightId}`)}`);
-          media = parseReels(json, "highlight");
+          media = await this.highlightMedia(bridge, parsed.highlightId);
           owner = media[0]?.ownerUsername ?? null;
           if (!media.length) throw new VaultError("not_found", "Ese highlight no tiene contenido visible.");
         }
@@ -659,11 +636,10 @@ export class InstagramService {
       for (const [profileId, group] of stories) {
         const row = this.repo.profileRow(profileId);
         if (!row) continue;
-        const igId = await this.userIdFor(bridge, row);
-        apply(group, parseReels(await bridge.apiGet(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(igId)}`), "story"));
+        apply(group, await this.storyMedia(bridge, row.username));
       }
       for (const [highlightId, group] of highlights) {
-        apply(group, parseReels(await bridge.apiGet(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(`highlight:${highlightId}`)}`), "highlight"));
+        apply(group, await this.highlightMedia(bridge, highlightId));
       }
     }
     return refreshed;

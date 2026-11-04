@@ -366,6 +366,22 @@ export function paginationHasMore(payloads: Json[]): boolean | null {
   return more ? true : end ? false : null;
 }
 
+/**
+ * Paginación de la cuadrícula del perfil (consulta GraphQL de la web). Ignora
+ * otras conexiones que la página también pide, como el feed de inicio.
+ * `null` si la página no pidió la cuadrícula por GraphQL.
+ */
+export function userTimelineHasMore(payloads: Json): boolean | null {
+  let result: boolean | null = null;
+  walk(payloads, (obj) => {
+    const connection = obj.xdt_api__v1__feed__user_timeline_graphql_connection;
+    if (isObj(connection) && isObj(connection.page_info) && typeof connection.page_info.has_next_page === "boolean") {
+      result = result === false ? false : connection.page_info.has_next_page;
+    }
+  });
+  return result;
+}
+
 // --------------------------------------------------------------- perfiles
 function count(obj: Obj, nested: string, flat: string): number | null {
   const n = obj[nested];
@@ -378,7 +394,8 @@ export function profileFromUser(user: Obj, username?: string): ExtractedProfile 
   if (!name) return null;
   return {
     username: name.toLowerCase(),
-    igId: valueString(user, ["id", "pk", "pk_id"]),
+    // `pk` primero: en las respuestas GraphQL nuevas `id` es el id de FB (1784…), no el pk.
+    igId: valueString(user, ["pk", "pk_id", "id"]),
     fullName: text(user.full_name),
     biography: text(user.biography),
     externalUrl: text(user.external_url),
@@ -394,19 +411,59 @@ export function profileFromUser(user: Obj, username?: string): ExtractedProfile 
   };
 }
 
-/** Busca el objeto de usuario del perfil pedido dentro de cualquier respuesta. */
-export function findProfile(payload: Json, username: string): ExtractedProfile | null {
+const PROFILE_FIELDS = [
+  "follower_count",
+  "edge_followed_by",
+  "following_count",
+  "media_count",
+  "edge_owner_to_timeline_media",
+  "biography",
+  "full_name",
+  "is_private",
+  "hd_profile_pic_url_info",
+  "pk",
+  "friendship_status",
+];
+
+/**
+ * Busca el objeto de usuario del perfil pedido. Las respuestas traen copias
+ * reducidas del mismo usuario (p. ej. el autor de cada post), así que se
+ * elige la más completa.
+ */
+export function findUser(payload: Json, username: string): Obj | null {
   const wanted = username.toLowerCase();
-  let found: ExtractedProfile | null = null;
+  let best: Obj | null = null;
+  let bestScore = 0;
   walk(payload, (obj) => {
-    if (found) return true;
     if (typeof obj.username !== "string" || obj.username.toLowerCase() !== wanted) return false;
     const shaped = "is_private" in obj || "profile_pic_url_hd" in obj || "profile_pic_url" in obj || "full_name" in obj;
     if (!shaped) return false;
-    found = profileFromUser(obj, wanted);
-    return true;
+    const score = 1 + PROFILE_FIELDS.filter((f) => f in obj && obj[f] !== null).length;
+    if (score > bestScore) {
+      best = obj;
+      bestScore = score;
+    }
+    return false;
   });
-  return found;
+  return best;
+}
+
+export function findProfile(payload: Json, username: string): ExtractedProfile | null {
+  const user = findUser(payload, username);
+  return user ? profileFromUser(user, username) : null;
+}
+
+/** Datos que la web incrusta en `<script type="application/json">` (SSR). */
+export function parseJsonScripts(html: string): Json[] {
+  const out: Json[] = [];
+  for (const match of html.matchAll(/<script\b[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/g)) {
+    try {
+      out.push(JSON.parse(match[1]));
+    } catch {
+      /* bloque no JSON */
+    }
+  }
+  return out;
 }
 
 /** Primeros posts incluidos en web_profile_info (edge_owner_to_timeline_media). */
@@ -444,6 +501,45 @@ export function parseReels(payload: Json, kind: "story" | "highlight"): Extracte
     }
   }
   return out;
+}
+
+/**
+ * Reels (stories o highlights) en cualquier forma: el HTML del visor de
+ * stories los incrusta en `xdt_api__v1__feed__reels_media` y en
+ * `xdt_api__v1__feed__reels_media__connection` (edges[].node).
+ */
+export function findReels(payload: Json): Obj[] {
+  const out: Obj[] = [];
+  const seen = new Set<string>();
+  walk(payload, (obj) => {
+    const id = idString(obj.id);
+    if (!id || !Array.isArray(obj.items) || !("reel_type" in obj || "latest_reel_media" in obj || isObj(obj.user))) return false;
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(obj);
+    }
+    return true;
+  });
+  return out;
+}
+
+/** Highlights del perfil en la respuesta GraphQL de la bandeja (edges[].node con id "highlight:…"). */
+export function findHighlights(payload: Json, username?: string): ExtractedHighlight[] {
+  const wanted = username?.toLowerCase() ?? null;
+  const out = new Map<string, ExtractedHighlight>();
+  walk(payload, (obj) => {
+    const id = idString(obj.id);
+    if (!id?.startsWith("highlight:") || !("title" in obj)) return false;
+    const owner = isObj(obj.user) ? text(obj.user.username) : null;
+    if (wanted && owner && owner.toLowerCase() !== wanted) return true;
+    const cover = isObj(obj.cover_media) && isObj(obj.cover_media.cropped_image_version) ? text(obj.cover_media.cropped_image_version.url) : null;
+    const highlightId = id.replace(/^highlight:/, "");
+    if (!out.has(highlightId)) {
+      out.set(highlightId, { highlightId, title: text(obj.title) ?? "", coverUrl: cover, itemCount: int(obj.media_count) ?? (Array.isArray(obj.items) ? obj.items.length : 0) });
+    }
+    return true;
+  });
+  return [...out.values()];
 }
 
 export function parseHighlightsTray(payload: Json): ExtractedHighlight[] {
